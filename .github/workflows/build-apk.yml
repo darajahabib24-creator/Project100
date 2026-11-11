@@ -16,6 +16,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm' # ⚡ Speeds up builds by caching dependencies
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -24,7 +25,7 @@ jobs:
           distribution: temurin
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci # ⚡ Faster, deterministic install based strictly on lockfile
 
       - name: Sync Capacitor
         run: npx cap sync android
@@ -40,3 +41,4 @@ jobs:
         with:
           name: vscode-clone-apk
           path: android/app/build/outputs/apk/debug/*.apk
+          
