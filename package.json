@@ -1,0 +1,19 @@
+{
+  "name": "vscode-clone",
+  "version": "1.0.0",
+  "description": "VS Code Editor Clone - Capacitor Android App",
+  "scripts": {
+    "build": "echo 'Copy your web build to www/'",
+    "cap:sync": "npx cap sync",
+    "cap:open": "npx cap open android"
+  },
+  "dependencies": {
+    "@capacitor/core": "^6.1.2",
+    "@capacitor/cli": "^6.1.2",
+    "@capacitor/android": "^6.1.2",
+    "@capacitor/app": "^6.0.1",
+    "@capacitor/haptics": "^6.0.1",
+    "@capacitor/keyboard": "^6.0.1",
+    "@capacitor/status-bar": "^6.0.1"
+  }
+}
