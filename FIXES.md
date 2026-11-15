@@ -1,0 +1,80 @@
+# VS Code Shell 0.2.1 -> 0.2.2 fixes
+
+Fixed APK: `VSCodeShell-0.2.2-armv7.apk` (armv7, minSdk 23, targetSdk 34)
+SHA-256: `7808f2c5f5eebdbef3156e57413fcf33a4968f6b12a0c80dd194b3c053b6b6e3`
+Signing key: `vscode-debug.keystore` (store/key password `android`, alias `androiddebugkey`).
+The key is new, so uninstall 0.2.1 before installing this build.
+
+## 1. Editor white screen / "server not up yet — check Terminal"
+
+`MainActivity.showTab("Editor")` resolved the URL *before* starting the server:
+
+```kotlin
+val url = resolveUrl(intent?.data)   // server not running -> "about:blank"
+if (!shell.isServerRunning()) { setStatus("starting vscode-server…"); shell.startServer() }
+v.loadUrl(url)                       // loads about:blank -> white page + the status text
+```
+
+Fix: `resolveUrl` now returns `file:///android_asset/www/loading.html` instead of
+`about:blank` when the server is not up. That page polls `http://127.0.0.1:8124/`
+and redirects to the workbench once it answers; after ~90 s it offers a Retry
+button that calls `Android.serverStart()`.
+
+New asset: `assets/www/loading.html`.
+
+## 2. Terminal was read-only (stdin closed immediately)
+
+`ShellManager.startTerminal()` passed `stdin = true` to `run()`, and `run()` starts
+a thread that closes the process output stream when that flag is set. The terminal
+process therefore got EOF on stdin right away, so `writeTerminal()` (typing) failed.
+
+Fix: pass `false` so the stdin pipe stays open.
+
+```kotlin
+this.termProc = run(cmd, onOutput, onExit, false)   // was true
+```
+
+## 3. Packages: apt did not work
+
+Two independent rootfs problems, both fixed at runtime in `ShellManager.prepare()`
+via a new `fixEnvironment()` called at the end of `prepare()`:
+
+* `/tmp` and `/var/tmp` ended up mode `0755`. `TarGzExtractor` only calls
+  `mkdirs()` for directories and `setExecutable(true,false)` for files; it never
+  applies the tar directory modes, so the `1777` sticky bit is lost. apt drops to
+  the `_apt` user for its helpers and could not create `/tmp/apt.conf.XXX`
+  ("Couldn't create temporary file ... for passing config to apt-key" ->
+  "The repository ... is not signed").
+  Fix: `Os.chmod("/tmp", 01777)` and `Os.chmod("/var/tmp", 01777)`.
+* `/etc/resolv.conf` was the build machine's systemd-resolved stub
+  (`nameserver 127.0.0.53` + an Azure internal search domain). On Android that
+  stub does not exist, so DNS failed. `proot -R` only binds the host
+  `/etc/resolv.conf` when it exists (it does not on Android), so the guest file is
+  used.
+  Fix: overwrite `rootfs/etc/resolv.conf` with public resolvers
+  (`8.8.8.8`, `8.8.4.4`, `1.1.1.1`).
+
+```kotlin
+private fun fixEnvironment() {
+    try {                                   // DNS must work for apt / extensions
+        File(rootfs, "etc/resolv.conf").writeText(
+            "nameserver 8.8.8.8\nnameserver 8.8.4.4\nnameserver 1.1.1.1\noptions edns0 trust-ad\n")
+    } catch (e: Exception) { Log.e("VSCodeShell", "fixEnvironment: resolv.conf failed", e) }
+    try {                                   // apt helpers run as _apt and need sticky /tmp
+        Os.chmod(File(rootfs, "tmp").absolutePath, 0b111_111_111_111)      // 01777
+        Os.chmod(File(rootfs, "var/tmp").absolutePath, 0b111_111_111_111)  // 01777
+    } catch (e: Exception) { Log.e("VSCodeShell", "fixEnvironment: chmod failed", e) }
+}
+```
+
+## Verification done here (x86_64 host, armhf rootfs under chroot + qemu-arm)
+
+* `apt-get update` and `apt-get install -y htop` succeed after the `/tmp` + resolv.conf fix.
+* `/opt/vscode-server/bin/code-server --host 127.0.0.1 --port 8124 ...` binds and
+  serves HTTP 200; `loading.html` was loaded in a browser and redirected into the
+  real workbench ("Welcome - Visual Studio Code").
+* `socat - EXEC:'/bin/bash --norc -i',pty,echo=0,stderr,setsid` with stdin held open
+  echoes typed input back (bash prompt + command output).
+
+Not verified: on-device behaviour (no Android device/emulator here). The APK parses,
+zips align and verifies with `apksigner`.
