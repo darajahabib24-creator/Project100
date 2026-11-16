@@ -133,7 +133,7 @@ Three independent defects, all fixed in `classes3.dex`:
   `LD_LIBRARY_PATH` to `ApplicationInfo.nativeLibraryDir` in `prootEnv()`.
 
 New build: `VSCodeShell-0.2.2-armv7-fixed.apk`
-SHA-256: `454c17fa3ad7d26e42f2e8097359703bd0c75a9717692e35e458218738fef6c3`
+SHA-256: `573be938129951151a274194cc0ecd93e731ab5d6500869f10dddbcc8c1121a2`
 
 Signing: the original `vscode-debug.keystore` is not in the repo, so this build
 is signed with a new key `vscode-debug-fixed.keystore` (store/key password
@@ -149,5 +149,13 @@ Verification done here:
 * `apksigner verify` and `zipalign -c -p 4` pass; `assets/rootfs.tar` is
   byte-identical (`a2b402ed…`).
 * Not verified: on-device behaviour (no Android device here).
+
+### 5.1 Launch crash in the first fixed build (fixed)
+
+The first follow-up build (sha `454c17fa…`) installed but died before the
+activity opened. Cause: `prootEnv()` called the **private** `getNativeLibDir()`
+with `invoke-virtual`. Private methods must be invoked with `invoke-direct`;
+ART rejects the class with a `VerifyError` at load, so the process never
+started. The call is now `invoke-direct` and the class verifies.
 
 
