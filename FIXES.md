@@ -81,13 +81,20 @@ zips align and verifies with `apksigner`.
 
 ## 4. Launch crash in the first 0.2.2 build (fixed)
 
-The first patched APK reassembled `classes3.dex` with `smali a --api 34`, which emits
-**dex version 039**. The shipped APK (and the other three dex files) are **dex 035**,
-and ART below Android 11 (API 30) refuses to load a 039 dex, so the app died on launch.
-Reassembled with `smali a --api 23` so every dex in the APK is 035 again; same package,
-versionCode and signing key, so it updates over the broken build.
+Root cause: invalid smali in the added `ShellManager.fixEnvironment()`. `getRootfs()`
+was emitted as `invoke-direct {v1, p0}` — called on an uninitialized `java.io.File`
+with the manager passed as an argument — and the `File` constructors were invoked on
+already-constructed objects. ART rejects the method with a `VerifyError` the first time
+`prepare()` calls it, so the app died on launch. It has been rewritten correctly
+(receiver `p0` for `getRootfs`, a fresh `new-instance` for every `File` and
+`FileOutputStream`) and the bytecode re-checked with `dexdump`.
+
+While investigating, the dex version was also normalized: `classes3.dex` is now
+assembled with `smali a --api 23`, so all four dex files are `dex\n035` like the
+shipped APK (`smali a --api 34` would emit 039). Same package, versionCode and
+signing key, so it updates over the broken build.
 
     for f in classes*.dex; do xxd -l 8 $f; done   # -> 6465 780a 3033 3500  (dex\n035)
 
-Fixed sha256: `b65a424db42099f0f8c13cd6efb47551fd96d56c0a8f781b57a1d98ed33462db`
+Fixed sha256: `ef1e41bc9b83bc7d38af7f6c7bd215dfe8a73c92336ad8804fb18998d8959a78`
 
