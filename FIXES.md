@@ -78,3 +78,16 @@ private fun fixEnvironment() {
 
 Not verified: on-device behaviour (no Android device/emulator here). The APK parses,
 zips align and verifies with `apksigner`.
+
+## 4. Launch crash in the first 0.2.2 build (fixed)
+
+The first patched APK reassembled `classes3.dex` with `smali a --api 34`, which emits
+**dex version 039**. The shipped APK (and the other three dex files) are **dex 035**,
+and ART below Android 11 (API 30) refuses to load a 039 dex, so the app died on launch.
+Reassembled with `smali a --api 23` so every dex in the APK is 035 again; same package,
+versionCode and signing key, so it updates over the broken build.
+
+    for f in classes*.dex; do xxd -l 8 $f; done   # -> 6465 780a 3033 3500  (dex\n035)
+
+Fixed sha256: `b65a424db42099f0f8c13cd6efb47551fd96d56c0a8f781b57a1d98ed33462db`
+
