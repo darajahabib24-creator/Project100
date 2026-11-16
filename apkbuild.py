@@ -18,12 +18,16 @@ Only the URL is required. The pipeline is fully automatic:
 What gets mirrored: HTML/CSS/JS, source files, icons, images, fonts, video and
 audio that the start page (and the pages it links to, same origin) reference.
 A generated index page is added if the folder has no index.html, so the result
-is always navigable offline.
+is always navigable offline. The launcher icon is the site's real favicon /
+apple-touch-icon (ICO is converted to PNG), falling back to a generated tile.
+If the mirrored start page fails to load, the app falls back to the live URL.
 
 Requirements (auto-detected, no arguments needed):
     * Android SDK with platforms/android-<api>/android.jar and
       build-tools/<ver>/{aapt2,d8,zipalign,apksigner}
-      (ANDROID_HOME / ANDROID_SDK_ROOT, or /usr/lib/android-sdk, or ./android-sdk)
+      (ANDROID_HOME / ANDROID_SDK_ROOT, or /usr/lib/android-sdk, or ./android-sdk).
+      If none is found, a minimal SDK is downloaded into ~/.apkbuild/android-sdk
+      (disable with --no-bootstrap).
     * JDK: javac, jar, keytool  (Java 11+)
 
 Note: only scrape/build content you have the rights to use.
@@ -32,6 +36,7 @@ Note: only scrape/build content you have the rights to use.
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import html as html_mod
 import os
@@ -73,6 +78,19 @@ FONT_EXT = {".woff", ".woff2", ".ttf", ".otf", ".eot"}
 SKIP_EXT = {".exe", ".dll", ".so", ".dmg", ".iso", ".bin", ".deb", ".rpm", ".msi", ".apk", ".aab"}
 
 MAX_FILE_BYTES = 8 * 1024 * 1024
+
+# Remove the throw-away project directory if the build fails, so a failed run
+# never leaves a stray folder behind (unless --keep-work was given).
+_CLEANUP = {"work": None, "keep": False, "done": False}
+
+
+def _atexit_cleanup():
+    w = _CLEANUP.get("work")
+    if w and not _CLEANUP.get("keep") and not _CLEANUP.get("done"):
+        shutil.rmtree(w, ignore_errors=True)
+
+
+atexit.register(_atexit_cleanup)
 
 
 def log(msg: str) -> None:
@@ -118,7 +136,6 @@ def make_png(size: int, rgb: tuple) -> bytes:
     rows = []
     for y in range(size):
         row = bytearray()
-        row.append(0)  # filter type
         for x in range(size):
             # simple border shading
             edge = min(x, y, size - 1 - x, size - 1 - y)
@@ -127,10 +144,184 @@ def make_png(size: int, rgb: tuple) -> bytes:
             else:
                 row += bytes((r, g, b, 255))
         rows.append(bytes(row))
-    raw = b"".join(rows)
-    ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+    return png_from_rgba(size, size, rows)
+
+
+def png_from_rgba(w: int, h: int, rows) -> bytes:
+    raw = b"".join(b"\x00" + bytes(row) for row in rows)
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)
     return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr)
             + _png_chunk(b"IDAT", zlib.compress(raw, 9)) + _png_chunk(b"IEND", b""))
+
+
+# -- image headers / ICO decoding -------------------------------------------
+def _png_size(data: bytes):
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        return struct.unpack(">II", data[16:24])
+    return (0, 0)
+
+
+def _gif_size(data: bytes):
+    if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+        return struct.unpack("<HH", data[6:10])
+    return (0, 0)
+
+
+def _jpeg_size(data: bytes):
+    if data[:2] != b"\xff\xd8":
+        return (0, 0)
+    i = 2
+    while i + 9 < len(data):
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        m = data[i + 1]
+        if m in (0xD8, 0xD9, 0x01) or 0xD0 <= m <= 0xD7:
+            i += 2
+            continue
+        if i + 4 > len(data):
+            break
+        ln = struct.unpack(">H", data[i + 2:i + 4])[0]
+        if 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC) and i + 9 <= len(data):
+            h, w = struct.unpack(">HH", data[i + 5:i + 9])
+            return (w, h)
+        i += 2 + ln
+    return (0, 0)
+
+
+def _webp_size(data: bytes):
+    if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return (0, 0)
+    off = 12
+    while off + 8 <= len(data):
+        tag = data[off:off + 4]
+        size = struct.unpack("<I", data[off + 4:off + 8])[0]
+        payload = off + 8
+        if tag == b"VP8X" and payload + 10 <= len(data):
+            w = 1 + int.from_bytes(data[payload + 4:payload + 7], "little")
+            h = 1 + int.from_bytes(data[payload + 7:payload + 10], "little")
+            return (w, h)
+        if tag == b"VP8 " and payload + 10 <= len(data) and data[payload + 3:payload + 6] == b"\x9d\x01\x2a":
+            w, h = struct.unpack("<HH", data[payload + 6:payload + 10])
+            return (w & 0x3FFF, h & 0x3FFF)
+        if tag == b"VP8L" and payload + 5 <= len(data) and data[payload] == 0x2F:
+            bits = int.from_bytes(data[payload + 1:payload + 5], "little")
+            return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+        off = payload + size + (size & 1)
+    return (0, 0)
+
+
+def _ico_size(data: bytes):
+    if len(data) < 6:
+        return (0, 0)
+    _res, typ, count = struct.unpack("<HHH", data[:6])
+    if typ != 1 or count == 0:
+        return (0, 0)
+    best = (0, 0)
+    for i in range(count):
+        off = 6 + i * 16
+        if off + 16 > len(data):
+            break
+        w, h = data[off], data[off + 1]
+        w = w or 256
+        h = h or 256
+        if w * h > best[0] * best[1]:
+            best = (w, h)
+    return best
+
+
+def _dib_to_png(img: bytes):
+    """Decode an ICO DIB payload (bottom-up BGR(A) + AND mask) into PNG bytes."""
+    if len(img) < 40:
+        return None
+    hdr = struct.unpack("<IiiHHIIiiII", img[:40])
+    bw, bh, bpp, comp = hdr[1], hdr[2], hdr[4], hdr[5]
+    if bw <= 0 or bh <= 0 or comp not in (0, 3) or bpp not in (4, 8, 24, 32):
+        return None
+    real_h = bh // 2 if bh % 2 == 0 and bh // 2 >= 1 else bh
+    real_w = bw
+    if real_w > 1024 or real_h > 1024:
+        return None
+    off = 40
+    palette = []
+    if bpp <= 8:
+        ncol = hdr[6] or (1 << bpp)
+        for i in range(min(ncol, 256)):
+            if off + 4 > len(img):
+                break
+            b, g, r, _ = img[off:off + 4]
+            palette.append((r, g, b))
+            off += 4
+    row_size = ((real_w * bpp + 31) // 32) * 4
+    need = row_size * real_h
+    if len(img) < off + need:
+        return None
+    px = img[off:off + need]
+    mask_row = ((real_w + 31) // 32) * 4
+    mask_off = off + need
+    mask = img[mask_off:mask_off + mask_row * real_h]
+    rows = []
+    for y in range(real_h):
+        src = real_h - 1 - y
+        row = bytearray()
+        for x in range(real_w):
+            i = src * row_size + x * (bpp // 8)
+            if bpp == 32:
+                b, g, r, a = px[i], px[i + 1], px[i + 2], px[i + 3]
+            elif bpp == 24:
+                b, g, r = px[i], px[i + 1], px[i + 2]
+                a = 255
+            else:
+                idx = px[i] if bpp == 8 else 0
+                r, g, b = palette[idx] if idx < len(palette) else (0, 0, 0)
+                a = 255 if idx else 0
+            if mask:
+                bit = (mask[src * mask_row + (x >> 3)] >> (7 - (x & 7))) & 1
+                if bit:
+                    a = 0
+            row += bytes((r, g, b, a))
+        rows.append(row)
+    return png_from_rgba(real_w, real_h, rows)
+
+
+def ico_to_png(data: bytes):
+    """Return the largest PNG embedded in an .ico (PNG payload or DIB), else None."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return data
+    if len(data) < 6:
+        return None
+    _res, typ, count = struct.unpack("<HHH", data[:6])
+    if typ != 1 or count == 0:
+        return None
+    best = None
+    for i in range(count):
+        off = 6 + i * 16
+        if off + 16 > len(data):
+            break
+        w, h, _c, _r, _p, bpp, size, img_off = struct.unpack("<BBBBHHII", data[off:off + 16])
+        if size == 0 or img_off + size > len(data):
+            continue
+        payload = data[img_off:img_off + size]
+        png = payload if payload[:8] == b"\x89PNG\r\n\x1a\n" else _dib_to_png(payload)
+        if png:
+            area = (w or 256) * (h or 256)
+            if best is None or area > best[0]:
+                best = (area, png)
+    return best[1] if best else None
+
+
+def image_size(data: bytes, ext: str):
+    if ext == ".png":
+        return _png_size(data)
+    if ext == ".gif":
+        return _gif_size(data)
+    if ext in (".jpg", ".jpeg"):
+        return _jpeg_size(data)
+    if ext == ".webp":
+        return _webp_size(data)
+    if ext == ".ico":
+        return _ico_size(data)
+    return (0, 0)
 
 
 # --------------------------------------------------------------------------
@@ -144,6 +335,7 @@ def normalize(url: str, base: str | None = None) -> str | None:
         return None
     if url.startswith("//"):
         url = "https:" + url
+    url = urllib.parse.quote(url, safe=":/?#[]@!$&'()*+,;=%")
     if url.startswith("data:") or url.startswith("javascript:") or url.startswith("mailto:") \
             or url.startswith("tel:") or url.startswith("about:") or url.startswith("#"):
         return None
@@ -193,6 +385,7 @@ try:
         def __init__(self):
             super().__init__(convert_charrefs=True)
             self.refs: list[str] = []
+            self.icon_links: list[tuple[str, str]] = []
             self.base: str | None = None
             self.title= ""
             self._in_title = False
@@ -201,6 +394,14 @@ try:
             d = {k: (v or "") for k, v in attrs}
             if tag == "base" and d.get("href"):
                 self.base = d["href"]
+            if tag == "link":
+                rel = (d.get("rel") or "").lower()
+                if d.get("href") and any(k in rel for k in ("icon", "apple-touch", "mask-icon")):
+                    self.icon_links.append((rel, d["href"]))
+            if tag == "meta":
+                key = (d.get("name") or d.get("property") or "").lower()
+                if d.get("content") and key in ("og:image", "twitter:image"):
+                    self.icon_links.append((key, d["content"]))
             for k in ("href", "src", "poster", "data-src", "data-href", "action", "formaction"):
                 if d.get(k):
                     self.refs.append(d[k])
@@ -227,6 +428,7 @@ except Exception:  # pragma: no cover
     class RefCollector:  # type: ignore[no-redef]
         def __init__(self):
             self.refs = []
+            self.icon_links = []
             self.base = None
             self.title = ""
 
@@ -263,6 +465,7 @@ class Scraper:
         self.refs_by_file: dict[str, list[str]] = {}
         self.title = ""
         self.icon_candidates: list[tuple[int, str]] = []
+        self.icon_links: list[tuple[str, str]] = []
         self._robots_disallow: list[str] = []
 
     # -- fetching ---------------------------------------------------------
@@ -310,7 +513,7 @@ class Scraper:
     # -- saving -----------------------------------------------------------
     def _save(self, url: str, data: bytes, ctype: str) -> str:
         p = urllib.parse.urlsplit(url)
-        raw = p.path or "/"
+        raw = urllib.parse.unquote(p.path) or "/"
         is_html = "html" in ctype.lower()
         if raw.endswith("/"):
             d = safe_rel_path(raw.rstrip("/"))
@@ -333,6 +536,72 @@ class Scraper:
                     score += 1
             self.icon_candidates.append((score, rel))
         return rel
+
+    # -- icon -------------------------------------------------------------
+    def resolve_icon(self):
+        """Find the site's real icon (link rel=icon / apple-touch-icon / favicon /
+        logo) and return {'ext': ..., 'data': bytes} with ICO converted to PNG."""
+        cands: list[tuple[int, str]] = []
+        for rel, href in self.icon_links:
+            u = normalize(href, self.start_url)
+            if not u:
+                continue
+            low = rel.lower()
+            if "apple-touch" in low:
+                pref = 6
+            elif "mask-icon" in low:
+                pref = 5
+            elif "icon" in low:
+                pref = 4
+            else:
+                pref = 3
+            cands.append((pref, u))
+        p = urllib.parse.urlsplit(self.start_url)
+        root = "%s://%s/" % (p.scheme, p.netloc)
+        for name in ("apple-touch-icon.png", "apple-touch-icon-precomposed.png",
+                     "favicon.ico", "favicon.png", "mstile-150x150.png",
+                     "android-chrome-192x192.png", "logo.png", "icon.png"):
+            cands.append((2, normalize(root + name)))
+        seen = set()
+        best = None
+        for pref, u in cands:
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            data = None
+            ext = ext_of(u)
+            rel_path = self.local_map.get(u)
+            if rel_path:
+                try:
+                    with open(os.path.join(self.mirror, rel_path), "rb") as f:
+                        data = f.read()
+                    ext = ext_of(rel_path)
+                except OSError:
+                    data = None
+            if data is None:
+                try:
+                    _ctype, data = self._fetch(u)
+                except Exception:
+                    continue
+                if len(data) > 512 * 1024:
+                    continue
+                if ext not in (".png", ".jpg", ".jpeg", ".webp", ".ico", ".gif") \
+                        and data[:8] == b"\x89PNG\r\n\x1a\n":
+                    ext = ".png"
+            if ext not in (".png", ".jpg", ".jpeg", ".webp", ".ico", ".gif"):
+                continue
+            if ext == ".ico":
+                png = ico_to_png(data)
+                if not png:
+                    continue
+                data, ext = png, ".png"
+            w, h = image_size(data, ext)
+            score = (pref, w * h)
+            if best is None or score > best[0]:
+                best = (score, ext, data)
+        if not best:
+            return None
+        return {"ext": best[1], "data": best[2]}
 
     # -- rewriting --------------------------------------------------------
     def _rewrite(self):
@@ -414,6 +683,7 @@ class Scraper:
                 if rc.title.strip() and not self.title:
                     self.title = html_mod.unescape(rc.title).strip()
                 self.refs_by_file[rel] = list(rc.refs)
+                self.icon_links.extend(rc.icon_links)
                 for ref in rc.refs:
                     nref = normalize(ref, rc.base or norm)
                     if nref and nref not in visited:
@@ -436,6 +706,7 @@ class Scraper:
             "bytes": self.total,
             "title": self.title,
             "icon": (sorted(self.icon_candidates, reverse=True)[0][1] if self.icon_candidates else None),
+            "icon_data": self.resolve_icon(),
             "map": self.local_map,
             "start_url": self.start_url,
         }
@@ -457,6 +728,44 @@ def github_info(url: str):
         branch = parts[3]
         subpath = "/".join(parts[4:])
     return {"owner": owner, "repo": repo, "branch": branch, "subpath": subpath}
+
+
+def github_icon(gh: dict, mirror: str):
+    """Icon for a GitHub repo: an icon-like file in the tree, else the owner avatar."""
+    pat = re.compile(r"(favicon|apple-touch|icon|logo)", re.I)
+    best = None
+    for dirpath, _, fns in os.walk(mirror):
+        for fn in fns:
+            if not pat.search(fn):
+                continue
+            ext = ext_of(fn)
+            if ext not in (".png", ".jpg", ".jpeg", ".webp", ".ico", ".gif"):
+                continue
+            try:
+                with open(os.path.join(dirpath, fn), "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            if ext == ".ico":
+                png = ico_to_png(data)
+                if not png:
+                    continue
+                data, ext = png, ".png"
+            w, h = image_size(data, ext)
+            if best is None or w * h > best[0]:
+                best = (w * h, ext, data)
+    if best:
+        return {"ext": best[1], "data": best[2]}
+    try:
+        u = "https://github.com/%s.png?size=192" % gh["owner"]
+        req = urllib.request.Request(u, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = r.read()
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return {"ext": ".png", "data": data}
+    except Exception:
+        pass
+    return None
 
 
 def fetch_github(gh: dict, mirror: str, timeout: int) -> dict:
@@ -518,6 +827,7 @@ def fetch_github(gh: dict, mirror: str, timeout: int) -> dict:
     files = sum(len(fs) for _, _, fs in os.walk(mirror))
     log("github: %d files mirrored" % files)
     return {"files": files, "bytes": 0, "title": title, "icon": None,
+            "icon_data": github_icon(gh, mirror),
             "map": {}, "start_url": url, "start": start}
 
 
@@ -607,18 +917,28 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.view.KeyEvent;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import java.lang.ref.WeakReference;
 
 public class MainActivity extends Activity {
 
     private WebView webView;
     private String startUrl;
+    private String remoteUrl = "__REMOTE_URL__";
+    private boolean fellBack = false;
 
     /** Named nested class: d8/R8 8.2 crashes on anonymous WebViewClient subclasses. */
     static class AppWebViewClient extends WebViewClient {
+        private final WeakReference<MainActivity> ref;
+
+        AppWebViewClient(MainActivity activity) {
+            this.ref = new WeakReference<MainActivity>(activity);
+        }
+
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
             return false;
@@ -635,9 +955,40 @@ public class MainActivity extends Activity {
             }
             return false;
         }
+
+        @Override
+        public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+            if (request.isForMainFrame()) {
+                MainActivity a = ref.get();
+                if (a != null) {
+                    a.onMainFrameError(request.getUrl() == null ? "" : request.getUrl().toString());
+                }
+            }
+        }
+
+        @Override
+        public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
+            MainActivity a = ref.get();
+            if (a != null) {
+                a.onMainFrameError(failingUrl == null ? "" : failingUrl);
+            }
+        }
     }
 
     static class AppWebChromeClient extends WebChromeClient {
+    }
+
+    void onMainFrameError(String url) {
+        if (fellBack || remoteUrl == null || remoteUrl.isEmpty()) {
+            return;
+        }
+        if (url != null && !url.startsWith("file://")) {
+            return;
+        }
+        fellBack = true;
+        if (webView != null) {
+            webView.loadUrl(remoteUrl);
+        }
     }
 
     @Override
@@ -659,7 +1010,7 @@ public class MainActivity extends Activity {
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         s.setUseWideViewPort(true);
         s.setLoadWithOverviewMode(true);
-        webView.setWebViewClient(new AppWebViewClient());
+        webView.setWebViewClient(new AppWebViewClient(this));
         webView.setWebChromeClient(new AppWebChromeClient());
         setContentView(webView);
         if (startUrl.startsWith("http") && !startUrl.startsWith("file")) {
@@ -788,27 +1139,39 @@ def write_project(work: str, args, info: dict, mirror: str) -> str:
             start = generate_index(assets_dir, app_name)
         start_url = "file:///android_asset/www/" + start
 
-    # icon
-    icon_src = info.get("icon")
-    icon_dst = os.path.join(res_dir, "drawable", "ic_launcher.png")
+    # icon: the site's real icon first, then any scraped raster, then a generated one
+    icon_data = info.get("icon_data")
+    icon_dst = None
     used_default = False
-    if icon_src:
-        src = os.path.join(mirror, icon_src)
-        if os.path.isfile(src) and ext_of(src) in (".png", ".jpg", ".jpeg", ".webp"):
-            shutil.copyfile(src, icon_dst)
-    if not os.path.isfile(icon_dst):
+    if icon_data and icon_data.get("data"):
+        ext = icon_data.get("ext") or ".png"
+        icon_dst = os.path.join(res_dir, "drawable", "ic_launcher" + ext)
+        with open(icon_dst, "wb") as f:
+            f.write(icon_data["data"])
+    if icon_dst is None:
+        icon_src = info.get("icon")
+        if icon_src:
+            src = os.path.join(mirror, icon_src)
+            if os.path.isfile(src) and ext_of(src) in (".png", ".jpg", ".jpeg", ".webp"):
+                icon_dst = os.path.join(res_dir, "drawable", "ic_launcher" + ext_of(src))
+                shutil.copyfile(src, icon_dst)
+    if icon_dst is None:
         h = int(hashlib.md5((pkg + app_name).encode()).hexdigest()[:6], 16)
         rgb = (30 + h % 180, 60 + (h >> 8) % 160, 120 + (h >> 16) % 120)
+        icon_dst = os.path.join(res_dir, "drawable", "ic_launcher.png")
         with open(icon_dst, "wb") as f:
             f.write(make_png(192, rgb))
         used_default = True
+    icon_label = "generated" if used_default else os.path.basename(icon_dst)
 
     def render(t: str) -> str:
+        remote = args.url.replace("\\", "\\\\").replace('"', '\\"')
         return (t.replace("__PACKAGE__", pkg)
                  .replace("__APP_NAME__", html_mod.escape(app_name))
                  .replace("__VERSION_CODE__", str(args.version_code))
                  .replace("__VERSION_NAME__", args.version_name)
-                 .replace("__START_URL__", start_url))
+                 .replace("__START_URL__", start_url)
+                 .replace("__REMOTE_URL__", remote))
 
     with open(os.path.join(work, "AndroidManifest.xml"), "w", encoding="utf-8") as f:
         f.write(render(MANIFEST))
@@ -820,13 +1183,76 @@ def write_project(work: str, args, info: dict, mirror: str) -> str:
         f.write(STYLES)
 
     log("project: package=%s name=%r start=%s icon=%s"
-        % (pkg, app_name, start, "generated" if used_default else str(icon_src)))
+        % (pkg, app_name, start, icon_label))
     return pkg
 
 
 # --------------------------------------------------------------------------
 # SDK discovery
 # --------------------------------------------------------------------------
+def bootstrap_sdk(args):
+    """Download a minimal Android SDK when none is installed."""
+    root = os.path.join(os.path.expanduser("~"), ".apkbuild", "android-sdk")
+    if os.path.isdir(os.path.join(root, "platforms")) and os.path.isdir(os.path.join(root, "build-tools")):
+        return root
+    log("Android SDK not found - bootstrapping into %s (downloads ~200 MB)" % root)
+    os.makedirs(root, exist_ok=True)
+    tools_zip = os.path.join(root, "cmdline-tools.zip")
+    url = "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+    sdkmanager = os.path.join(root, "cmdline-tools", "bin", "sdkmanager")
+    if not os.path.isfile(sdkmanager):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=180) as r:
+                data = r.read()
+            with open(tools_zip, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            die("could not download the Android command-line tools: %s" % e)
+        try:
+            with zipfile.ZipFile(tools_zip) as zf:
+                zf.extractall(root)
+        except Exception as e:
+            die("could not unpack the command-line tools: %s" % e)
+        os.remove(tools_zip)
+    # zipfile does not restore the executable bit
+    bin_dir = os.path.dirname(sdkmanager)
+    for name in os.listdir(bin_dir):
+        p = os.path.join(bin_dir, name)
+        if os.path.isfile(p):
+            try:
+                os.chmod(p, 0o755)
+            except OSError:
+                pass
+    if not os.path.isfile(sdkmanager):
+        die("sdkmanager missing after extraction")
+    env = dict(os.environ)
+    env["ANDROID_HOME"] = root
+    env["ANDROID_SDK_ROOT"] = root
+    try:
+        subprocess.run([sdkmanager, "--sdk_root=" + root, "--licenses"],
+                       input="y\n" * 30, text=True, cwd=bin_dir,
+                       env=env, timeout=300, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([sdkmanager, "--sdk_root=" + root,
+                        "platforms;android-34", "build-tools;34.0.0"],
+                       text=True, cwd=bin_dir, env=env, timeout=1200)
+    except Exception as e:
+        die("SDK bootstrap failed: %s" % e)
+    bt_dir = os.path.join(root, "build-tools")
+    for name in os.listdir(bt_dir) if os.path.isdir(bt_dir) else []:
+        d = os.path.join(bt_dir, name)
+        if not os.path.isdir(d):
+            continue
+        for fn in os.listdir(d):
+            fp = os.path.join(d, fn)
+            if os.path.isfile(fp):
+                try:
+                    os.chmod(fp, 0o755)
+                except OSError:
+                    pass
+    return root
+
+
 def find_tools(args):
     cands = []
     for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
@@ -842,8 +1268,13 @@ def find_tools(args):
         if c and os.path.isdir(os.path.join(c, "platforms")) and os.path.isdir(os.path.join(c, "build-tools")):
             sdk = os.path.abspath(c)
             break
+    if not sdk and not args.no_bootstrap:
+        root = bootstrap_sdk(args)
+        if os.path.isdir(os.path.join(root, "platforms")) and os.path.isdir(os.path.join(root, "build-tools")):
+            sdk = root
     if not sdk:
-        die("Android SDK not found. Set ANDROID_HOME or --sdk-root (need platforms/ and build-tools/).")
+        die("Android SDK not found. Set ANDROID_HOME or --sdk-root (need platforms/ and build-tools/), "
+            "or drop --no-bootstrap to let apkbuild download it.")
 
     platforms = sorted(os.listdir(os.path.join(sdk, "platforms")))
     if not platforms:
@@ -1001,6 +1432,8 @@ def parse_args(argv):
     ap.add_argument("--api", type=int, default=None, help="compile against this android.jar API level")
     ap.add_argument("--target-sdk", type=int, default=34)
     ap.add_argument("--sdk-root", default=None)
+    ap.add_argument("--no-bootstrap", action="store_true",
+                    help="do not download an Android SDK if none is found")
     ap.add_argument("--keystore", default=None)
     ap.add_argument("--ks-pass", default="android")
     ap.add_argument("--ks-alias", default="androiddebugkey")
@@ -1020,6 +1453,9 @@ def main(argv=None):
 
     out_abs = os.path.abspath(args.out)
     work = tempfile.mkdtemp(prefix="apkbuild-")
+    _CLEANUP["work"] = work
+    _CLEANUP["keep"] = bool(args.keep_work)
+    _CLEANUP["done"] = False
     mirror = os.path.join(work, "mirror")
     os.makedirs(mirror, exist_ok=True)
 
@@ -1052,6 +1488,7 @@ def main(argv=None):
     log("project generated in %s" % work)
 
     if args.no_build:
+        _CLEANUP["done"] = True
         log("(--no-build) done; project kept at %s" % work)
         return 0
 
@@ -1071,6 +1508,7 @@ def main(argv=None):
         log("work dir kept: %s" % work)
     else:
         shutil.rmtree(work, ignore_errors=True)
+    _CLEANUP["done"] = True
     return 0
 
 
