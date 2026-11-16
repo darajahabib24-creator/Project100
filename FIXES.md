@@ -98,3 +98,56 @@ signing key, so it updates over the broken build.
 
 Fixed sha256: `ef1e41bc9b83bc7d38af7f6c7bd215dfe8a73c92336ad8804fb18998d8959a78`
 
+## 5. Crash on Terminal / Packages (0.2.2 follow-up)
+
+Symptom: app opens, rootfs pack starts loading, tapping Terminal or Packages kills the app.
+
+Three independent defects, all fixed in `classes3.dex`:
+
+* **UI updates from background threads.** `MainActivity.setStatus()` called
+  `TextView.setText()` directly. It is invoked from the extraction thread
+  (`onExtractProgress` / `onExtractDone`), the server reader thread
+  (`onServerOutput`) and the exec reader thread (`onExecExit`). After the first
+  layout pass `setText` throws `CalledFromWrongThreadException`:
+  - `onExtractProgress` aborted the rootfs extraction after the first frame
+    (the marker is never written, so every launch re-extracts and the rootfs is
+    always incomplete);
+  - `onExecExit` threw on the reader thread *outside* any try/catch, so the
+    process died ("Packages" crash);
+  - `onServerOutput` killed the server reader thread.
+  Fix: `setStatus` now posts a `MainActivity$StatusRunnable` to the TextView,
+  so it is always executed on the UI thread.
+
+* **`jsQuote()` built invalid JavaScript.** It did
+  `JSONObject{"v":s}.toString().substring(2, len-2)`, which yields `v":"...`
+  instead of a quoted literal. Every `window.onTermData(...)` /
+  `window.onExecData(...)` call was a syntax error, so terminal and apt output
+  never rendered. Fixed to `substring(5, len-1)` (the quoted JSON value).
+
+* **proot could not load on Android.** The bundled `libproot.so` is Termux
+  proot 5.1.107.102 (arm); its `DT_NEEDED` is `libtalloc.so.2` and
+  `libandroid-shmem.so`, neither of which is in the APK or the Debian rootfs.
+  Every `proot` exec (Terminal, Packages, Editor server) failed in the dynamic
+  linker. Fix: bundle `lib/armeabi-v7a/libtalloc.so.2` and
+  `libandroid-shmem.so` (extracted from the matching Termux packages) and set
+  `LD_LIBRARY_PATH` to `ApplicationInfo.nativeLibraryDir` in `prootEnv()`.
+
+New build: `VSCodeShell-0.2.2-armv7-fixed.apk`
+SHA-256: `454c17fa3ad7d26e42f2e8097359703bd0c75a9717692e35e458218738fef6c3`
+
+Signing: the original `vscode-debug.keystore` is not in the repo, so this build
+is signed with a new key `vscode-debug-fixed.keystore` (store/key password
+`android`, alias `androiddebugkey`, `CN=Android Debug,O=Android,C=US`).
+Uninstall 0.2.2 before installing it. If the original keystore is still
+available, `VSCodeShell-0.2.2-armv7-fixed-unsigned.apk` is zip-aligned and
+unsigned, ready to be signed with the old key for an in-place update.
+
+Verification done here:
+
+* `classes3.dex` re-assembled with `smali a --api 23` (`dex\n035`), class list
+  identical to the shipped dex plus `MainActivity$StatusRunnable`.
+* `apksigner verify` and `zipalign -c -p 4` pass; `assets/rootfs.tar` is
+  byte-identical (`a2b402ed…`).
+* Not verified: on-device behaviour (no Android device here).
+
+
