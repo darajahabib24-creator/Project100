@@ -4,10 +4,9 @@ on:
   workflow_dispatch: # Allows you to manually trigger this from the GitHub Actions tab
 
 # Grants your SSH session permission to push changes back to the repository
- permissions:
-    contents: write
+permissions:
+      contents: write
     workflows: write 
-
 jobs:
   interactive-session:
     runs-on: ubuntu-latest
