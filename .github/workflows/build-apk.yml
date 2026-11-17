@@ -5,8 +5,8 @@ on:
 
 # Grants your SSH session permission to push changes back to the repository
 permissions:
-      contents: write
-    workflows: write 
+  contents: write
+    
 jobs:
   interactive-session:
     runs-on: ubuntu-latest
