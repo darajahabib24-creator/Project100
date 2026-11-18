@@ -1,5 +1,0 @@
-/build/
-/rootfs/
-/ubuntu-arm64/
-/debian-arm64/
-*.tar.gz.part
