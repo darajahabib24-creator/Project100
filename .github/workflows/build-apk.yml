@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libffi-dev python3-dev cargo rustc
-          curl -fsSL https://githubusercontent.com | bash
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           # Automatically restore saved Hermes configs if they exist in the repo
           if [ -d "./hermes-backup" ]; then
             mkdir -p ~/.hermes
