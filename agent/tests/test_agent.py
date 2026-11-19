@@ -929,6 +929,39 @@ def test_no_spin_flag():
     assert args.no_spin is True
 
 
+def _run(args, cwd=None):
+    import subprocess
+    return subprocess.run([sys.executable, *args], cwd=cwd, capture_output=True,
+                          text=True, timeout=120)
+
+
+def test_cli_runs_as_direct_script_from_agent_dir():
+    """Regression: `python3 cli.py` from inside agent/ used to fail on relative
+    imports. It must work without any install step."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    agent_dir = os.path.join(repo, "agent")
+    r = _run(["cli.py", "--help"], cwd=agent_dir)
+    assert r.returncode == 0, r.stderr
+    assert "usage:" in r.stdout
+
+
+def test_cli_runs_as_direct_script_from_repo_root():
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    r = _run([os.path.join("agent", "cli.py"), "--help"], cwd=repo)
+    assert r.returncode == 0, r.stderr
+    assert "usage:" in r.stdout
+
+
+def test_module_form_runs():
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    r = _run(["-m", "agent", "--help"], cwd=repo)
+    assert r.returncode == 0, r.stderr
+    assert "usage:" in r.stdout
+
+
 if __name__ == "__main__":
     import tempfile
     from pathlib import Path

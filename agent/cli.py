@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """cli.py - run the local agent.
 
-    python3 -m agent.cli "goal text"
-    python3 -m agent.cli "goal" --model http --memory ~/.agent/memory.json
-    python3 -m agent.cli "goal" --replay transcript.json
+Works from any directory, in all three of these forms:
+
+    python3 agent/cli.py "goal text"        # direct script (adds parent to path)
+    python3 -m agent.cli "goal text"        # module form
+    agent "goal text"                       # after: pip install -e .
 
 No cloud API, no key. --model local is a deterministic stand-in so the loop can
 be exercised before you attach your own weights.
@@ -17,11 +19,19 @@ import os
 import sys
 import time
 
-from .core import Agent, Memory, ToolBus
-from .models import make_model
-from .policy import ScriptedModel
-from .tools import default_tools
-from .ui import Spinner
+try:  # normal case: imported as part of the package
+    from .core import Agent, Memory, ToolBus
+    from .models import make_model
+    from .policy import ScriptedModel
+    from .tools import default_tools
+    from .ui import Spinner
+except ImportError:  # run as a plain script: python3 agent/cli.py
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from agent.core import Agent, Memory, ToolBus
+    from agent.models import make_model
+    from agent.policy import ScriptedModel
+    from agent.tools import default_tools
+    from agent.ui import Spinner
 
 
 def parse_args(argv=None):
