@@ -13,11 +13,16 @@ goal -> plan -> [ think -> tool call -> observe ]* -> report
 ```bash
 # from the repo root
 python3 agent/cli.py "create a file called plan.md" --cwd /tmp/work
+python3 -m agent "what is the speed of light"        # same thing, shorter
+python3 -m agent.cli "goal" --model http            # explicit module form
 
 # or install once and use the `agent` command anywhere
 pip install -e .
 agent "read report.txt" --cwd /tmp/work
 ```
+
+All three invocation forms work from any directory, including running
+`cli.py` directly - no install step required.
 
 Run the tests (no network, no model):
 
