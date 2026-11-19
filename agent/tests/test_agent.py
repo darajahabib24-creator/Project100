@@ -962,6 +962,17 @@ def test_module_form_runs():
     assert "usage:" in r.stdout
 
 
+def test_no_goal_shows_help_not_error():
+    """Regression: bare `python3 cli.py` used to error out."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    r = _run(["agent/cli.py"], cwd=repo)
+    assert r.returncode == 0, r.stderr
+    assert "usage:" in r.stdout
+    assert "example:" in r.stdout
+    assert "required" not in r.stderr
+
+
 if __name__ == "__main__":
     import tempfile
     from pathlib import Path

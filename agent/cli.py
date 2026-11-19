@@ -34,7 +34,7 @@ except ImportError:  # run as a plain script: python3 agent/cli.py
     from agent.ui import Spinner
 
 
-def parse_args(argv=None):
+def make_parser():
     p = argparse.ArgumentParser(prog="agent", description="Local autonomous agent.")
     p.add_argument("goal", nargs="?", help="what the agent should do")
     p.add_argument("--model", default="local", choices=["local", "stub", "http", "module"],
@@ -51,7 +51,11 @@ def parse_args(argv=None):
     p.add_argument("--no-spin", action="store_true",
                    help="disable the animated spinner (keeps the step log)")
     p.add_argument("--dump", help="write the finished transcript to this JSON")
-    return p.parse_args(argv)
+    return p
+
+
+def parse_args(argv=None):
+    return make_parser().parse_args(argv)
 
 
 def _coerce_replies(payload) -> list[str]:
@@ -101,8 +105,10 @@ def main(argv=None) -> int:
         return 2
 
     if not args.goal and not args.replay:
-        print("error: a goal (or --replay) is required", file=sys.stderr)
-        return 2
+        # No goal: show how to use it rather than a bare error.
+        make_parser().print_help()
+        print("\nexample: agent \"what is the speed of light\"")
+        return 0
     goal = args.goal or "replay"
 
     memory = None if args.no_memory else Memory(args.memory)
