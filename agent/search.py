@@ -18,6 +18,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .verify import STOP, tokens
+
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -296,8 +298,148 @@ def is_encyclopedic(query: str) -> bool:
 
 # Maps engine name -> module-level function name, resolved at call time so
 # tests (and callers) can monkeypatch the module attribute.
-ENGINES = {"ddg-lite": "ddg_lite", "brave": "brave_html",
-           "wikipedia": "wikipedia", "mojeek": "mojeek"}
+def bing(query: str, count: int = 10) -> list[dict]:
+    """Bing web search via its RSS endpoint - clean URLs, no key, no redirect
+    unwrapping needed."""
+    url = "https://www.bing.com/search?" + urllib.parse.urlencode(
+        {"q": query, "format": "rss", "count": count})
+    body = _get(url, headers={"Accept": "application/xml, text/xml, */*"})
+    if len(body) < MIN_BODY:
+        raise SearchError("bing: suspiciously short body")
+    if "<item>" not in body and "<rss" not in body:
+        raise SearchError("bing: not an RSS feed (blocked or changed)")
+    results = []
+    for m in re.finditer(r"<item>(.*?)</item>", body, re.S):
+        item = m.group(1)
+        t = re.search(r"<title>(.*?)</title>", item, re.S)
+        l = re.search(r"<link>(.*?)</link>", item, re.S)
+        d = re.search(r"<description>(.*?)</description>", item, re.S)
+        if not (t and l):
+            continue
+        href = html_mod.unescape(l.group(1).strip())
+        if not _valid(href):
+            continue
+        results.append(_result(href, _strip_tags(t.group(1)),
+                               _strip_tags(d.group(1)) if d else "", "bing"))
+        if len(results) >= count:
+            break
+    if not results:
+        raise SearchError("bing: no results parsed")
+    return results
+
+
+def short_answer(question: str, sources: list[dict], limit: int = 120) -> str:
+    """Reduce sources to ONE line - the answer, not the story.
+
+    Strategy: find the sentence that names the subject and says what it is,
+    then cut it at the first clause boundary. Falls back to the sentence with
+    the most question overlap.
+    """
+    q = question.strip().lower()
+    attr = subj = ""
+    m = re.search(r"\bwhat(?: is|'s| are)\s+the\s+(.+?)\s+of\s+(.+?)\s*\??\s*$", q)
+    if m:                                    # "what is the capital of France"
+        attr, subj = m.group(1), m.group(2)
+    else:
+        m = re.search(r"\b(what(?: is|'s| are)|who(?: is|'s| was)|when was|"
+                      r"when is|where is|which is)\s+(?:the\s+|a\s+|an\s+)?"
+                      r"(.+?)\s*\??\s*$", q)
+        if m:
+            attr = m.group(2)
+
+    def sentences(text: str):
+        return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
+
+    def clean(cand: str) -> str:
+        cand = re.split(r"\s+-\s+", cand)[0].strip()
+        # A definition ("a high-level, general-purpose language") keeps its
+        # commas; anything else is cut at the first comma for brevity.
+        if not re.match(r"^(the|a|an)\s", cand.lower()):
+            cand = cand.split(",", 1)[0].strip()
+        cand = cand[:limit].rstrip(" .;,")
+        return (cand[0].upper() + cand[1:]) if cand else ""
+
+    qtoks = set(tokens(question)) - STOP
+
+    for s in sources:
+        for sent in sentences(s.get("text", "")):
+            low = sent.lower()
+            # 1. "the capital of France is Paris"
+            if attr and subj:
+                mm = re.search(re.escape(attr) + r"\s+of\s+" +
+                               re.escape(subj) + r"\s+is\s+(.+)", low)
+                if mm:
+                    got = clean(sent[mm.start(1):])
+                    if got:
+                        return got
+                # 2. "Paris is the capital of France" / "... the capital and
+                #    largest city of France"
+                mm = re.search(r"([a-z][^.,;]*?)\s+is\s+(?:the\s+|a\s+|an\s+)?" +
+                               re.escape(attr) +
+                               r"(?:\s+(?:and|or)\s+[a-z]+)*" +
+                               r"(?:\s+of\s+" + re.escape(subj) + r")?\s*[.,]",
+                               low)
+                if mm:
+                    got = clean(re.sub(r"\[[^\]]*\]", "", sent[mm.start(1):mm.end(1)]))
+                    if got:
+                        return got
+                # 3. "France is the capital ..." style
+                mm = re.search(re.escape(subj) + r"\s+is\s+(?:the\s+|a\s+|an\s+)"
+                               r"(?:capital|capital city|largest city)", low)
+                if mm:
+                    got = clean(sent[:mm.start()])
+                    if got:
+                        return got
+            # 4. generic "<attr> [of/in ...] is ..." - "speed of light in vacuum is"
+            if attr:
+                mm = re.search(re.escape(attr) +
+                               r"(?:\s+(?:of|in|at|on|for)\s+[a-z]+)*"
+                               r"\s+is\s+(.+)", low)
+                if mm:
+                    raw = sent[mm.start(1):]
+                    num = re.search(r"\d[\d,.]*\s*(?:m/s|km/h|kg|%|"
+                                    r"miles|kilometers?|years?|days?|hours?|"
+                                    r"minutes?|seconds?|people|dollars|USD|EUR|"
+                                    r"tonnes?|grams?|litres?|liters?)", raw)
+                    if num and len(raw) > 60:
+                        return num.group(0)
+                    cand = clean(raw)
+                    if cand:
+                        return cand
+
+            # 5. "written by William Shakespeare" / "founded by ..."
+            if re.search(r"\bwho\b", q):
+                pm = re.search(r"\b(?:written|directed|created|founded|"
+                               r"invented|discovered|composed|built|authored|"
+                               r"painted|designed) by ([A-Z][A-Za-z.'-]+"
+                               r"(?:\s+[A-Z][A-Za-z.'-]+){0,2})", sent)
+                if pm:
+                    return pm.group(1)
+
+    # 2. best-overlap sentence, trimmed
+    best, best_score = "", -1.0
+    for s in sources:
+        for sent in sentences(s.get("text", "")):
+            if len(sent) < 12:
+                continue
+            stoks = set(tokens(sent))
+            if not stoks:
+                continue
+            score = len(qtoks & stoks) / len(qtoks | stoks)
+            if score > best_score:
+                best, best_score = sent, score
+    if best:
+        return best[:limit].rstrip(" .;,")
+
+    # 3. last resort: first source's title
+    for s in sources:
+        if s.get("title"):
+            return s["title"][:limit]
+    return ""
+
+
+ENGINES = {"ddg-lite": "ddg_lite", "brave": "brave_html", "bing": "bing",
+           "mojeek": "mojeek", "wikipedia": "wikipedia"}
 
 
 def _engine(name: str):
@@ -316,9 +458,9 @@ def web_search(query: str, count: int = 10, engines: list[str] | None = None,
     if not query:
         raise SearchError("empty query")
 
-    order = engines or ["ddg-lite", "mojeek", "brave", "wikipedia"]
+    order = engines or ["ddg-lite", "bing", "mojeek", "brave"]
     if is_encyclopedic(query):
-        order = ["wikipedia"] + [e for e in order if e != "wikipedia"]
+        order = ["bing", "ddg-lite", "mojeek", "brave"]
 
     fallbacks, last_err = [], None
     retried: set[str] = set()

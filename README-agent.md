@@ -105,33 +105,41 @@ Web: `web_search`, `answer_question`, `verify_answer`, `browse_url`, `fetch_url`
 
 ## Chat mode (it stays open)
 
-```
-agent -i
-```
-
-The agent keeps running and keeps its context, so you can ask follow-ups:
+On a terminal, chat is the default — it stays open and keeps context:
 
 ```
-agent -i
+$ agent
+agent - ask anything. 'quit' to exit.
+------------------------------------------------------------
 > what is the capital of France
-... works, answers ...
-> and what is its population
-... remembers the last question ...
+Paris
+> who wrote Hamlet
+William Shakespeare
 > quit
+bye
 ```
 
-Type `quit`, `exit`, `q` or `bye`, or press Ctrl-D / Ctrl-C to leave. Add a goal
-to start somewhere: `agent -i "what is the speed of light"`.
+The spinner shows `thinking .....` while it works and `working ..... <tool>` while
+a tool runs. Answers are ONE line - the answer, not the article. Details
+(sources, confidence) are still computed and kept in the transcript; `--dump`
+saves them.
+
+Use `--once` to answer a single goal and exit, or pass a goal to open there:
+
+```
+agent "what is the speed of light"      # one shot
+agent --once "what is the speed of light"
+agent -i "what is the speed of light"   # start in chat at this question
+```
 
 ## The web: find things and get right answers
 
 Three stages, and the agent uses them from the default policy with no weights:
 
 1. **Find** - `web_search` queries the open web with no key: DuckDuckGo Lite,
-   Mojeek, Brave, then Wikipedia. Which engines failed is reported, so you can
-   see provenance. Factual questions ("what is X", "who wrote Y") start at
-   Wikipedia; opinion and comparison questions ("best...", "vs", "cheapest")
-   go straight to the general web.
+   Bing (RSS), Mojeek, then Brave. Wikipedia is not used as a source; results
+   that happen to be Wikipedia pages are just organic hits. Which engines
+   failed is reported, so you can see provenance.
 2. **Read** - `browse_url` fetches a page and reduces it to readable text
    (stdlib HTML pass, no headless browser). It rejects pages that yield almost
    no text, which is how bot walls and JS-only sites announce themselves.
@@ -139,9 +147,10 @@ Three stages, and the agent uses them from the default policy with no weights:
    and returns a confidence label (`high`/`medium`/`low`/`unverified`) plus
    which sources support or contradict it.
 
-`answer_question` does all three: Wikipedia candidate + web search + reads the
-top result pages, then reports the answer, the top web results with snippets,
-and a confidence label. It never presents a snippet as the answer.
+`answer_question` does all three and prints ONE line first - the answer
+(`Paris`, `William Shakespeare`, `299792458 m/s`) - with the sources, top web
+results and a confidence label after a `---` separator. Chat mode shows only
+the line.
 
 ```bash
 agent "what is the speed of light"                 # cited answer + reads the page

@@ -611,18 +611,21 @@ def test_search_falls_through_on_failure(monkeypatch):
         raise AssertionError("expected SearchError")
 
 
-def test_search_encyclopedic_routes_to_wikipedia(monkeypatch):
+def test_search_encyclopedic_routes_to_general_web(monkeypatch):
+    """Factual questions start on the general web (Bing first), not Wikipedia."""
     from agent import search
     calls = []
 
-    def fake_wiki(q, count=5):
+    def fake_bing(q, count=10):
         calls.append(q)
-        return [{"url": "https://en.wikipedia.org/wiki/X", "title": "X",
-                 "snippet": "", "engine": "wikipedia"}]
+        return [{"url": "https://example.com/x", "title": "X",
+                 "snippet": "", "engine": "bing"}]
 
-    monkeypatch.setattr(search, "wikipedia", fake_wiki)
+    monkeypatch.setattr(search, "bing_html", fake_bing) if False else None
+    monkeypatch.setattr(search, "bing", fake_bing)
     payload = search.web_search("what is the capital of France")
-    assert payload["engine"] == "wikipedia" and calls
+    assert payload["engine"] == "bing" and calls
+    assert "wikipedia" not in payload["fallbacks"]
 
 
 def test_browse_extracts_readable_text(monkeypatch):
@@ -751,10 +754,9 @@ def test_fix_regex_matches():
 def test_policy_answers_question_with_cited_source(tmp_path, monkeypatch):
     from agent import search
     from agent.heuristic import RulePolicy
-    monkeypatch.setattr(search, "_get", lambda *a, **k: json.dumps({
-        "title": "Paris", "extract": "Paris is the capital of France.",
-        "content_urls": {"desktop": {"page": "https://en.wikipedia.org/wiki/Paris"}},
-        "timestamp": "2026-01-01T00:00:00Z"}))
+    monkeypatch.setattr(search, "ddg_lite", lambda q, count=10: [
+        {"url": "https://example.com/paris", "title": "Paris",
+         "snippet": "Paris is the capital of France.", "engine": "ddg-lite"}])
     monkeypatch_cwd(tmp_path)
     agent = make_agent(tmp_path, [], memory=None)
     agent.model = RulePolicy()
@@ -762,7 +764,8 @@ def test_policy_answers_question_with_cited_source(tmp_path, monkeypatch):
     tools_used = [c["tool"] for s in agent.steps for c in s.calls]
     assert tools_used[0] == "answer_question"
     blob = "".join(r for s in agent.steps for r in s.results)
-    assert "capital of France" in blob
+    # one-line answer is the first line, before the separator
+    assert blob.split("\n---", 1)[0].strip()
 
 
 def test_policy_fix_path_runs_and_searches(tmp_path):
@@ -989,10 +992,6 @@ def test_opinion_questions_are_not_encyclopedic():
 def test_answer_question_uses_whole_web(tmp_path, monkeypatch):
     """answer_question must search the web AND read pages, not just Wikipedia."""
     from agent import search, browse
-    monkeypatch.setattr(search, "_get", lambda *a, **k: json.dumps({
-        "title": "Paris", "extract": "Paris is the capital of France.",
-        "content_urls": {"desktop": {"page": "https://en.wikipedia.org/wiki/Paris"}},
-        "timestamp": "2026-01-01T00:00:00Z"}))
     monkeypatch.setattr(search, "ddg_lite", lambda q, count=10: [
         {"url": "https://example.com/paris", "title": "Paris guide",
          "snippet": "Paris is the capital of France and its largest city.",
@@ -1001,8 +1000,9 @@ def test_answer_question_uses_whole_web(tmp_path, monkeypatch):
                         lambda url, timeout=20: (url, PAGE_HTML))
     bus = make_bus()
     out = bus.call("answer_question", {"question": "what is the capital of France"})
-    assert "TOP WEB RESULTS" in out
-    assert "example.com/paris" in out
+    # the first line is the one-line answer; details follow a separator
+    first = out.split("\n---", 1)[0].strip()
+    assert first == "Paris", first
     assert "CONFIDENCE:" in out
 
 

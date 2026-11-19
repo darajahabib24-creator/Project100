@@ -15,7 +15,7 @@ from typing import Any
 from .core import Tool, ToolError
 from .browse import BrowseError, browse, format_page
 from .search import (SearchError, direct_answer, format_answer, format_results,
-                     is_encyclopedic, web_search)
+                     is_encyclopedic, short_answer, web_search)
 from .verify import verify_claim
 
 
@@ -71,32 +71,33 @@ class AnswerQuestion(Tool):
     def run(self, question: str, read_pages: int = 2, read_page: bool = True) -> str:
         sources: list[dict] = []
         encyclopedic = is_encyclopedic(question)
-        ans = direct_answer(question) if encyclopedic else {}
+        ans: dict = {}      # Wikipedia is not used - the open web only
         if ans:
             sources.append({"title": ans.get("title", ""),
                             "url": ans.get("url", ""),
                             "text": ans.get("extract", "")[:4000]})
 
-        # Search the open web. For opinion questions, skip Wikipedia entirely
-        # and use the general engines so review/comparison sites rank.
+        # Search the open web: DuckDuckGo, Bing, Mojeek, Brave.
         try:
-            engines = None if encyclopedic else ["ddg-lite", "mojeek", "brave", "wikipedia"]
+            engines = None if encyclopedic else ["ddg-lite", "bing", "mojeek", "brave"]
             res = web_search(question, count=8, engines=engines)
             web_results = res.get("results", [])
             engine = res.get("engine", "?")
             fallbacks = res.get("fallbacks", [])
         except SearchError as exc:
-            if not sources:
-                raise ToolError(str(exc)) from exc
-            web_results, engine, fallbacks = [], "wikipedia", []
+            raise ToolError(str(exc)) from exc
 
         # Read the top result pages so the answer is checked against real pages.
         seen = {s["url"] for s in sources if s["url"]}
         read = []
         for r in web_results:
-            if len(read) >= max(1, int(read_pages)):
-                break
             url = (r.get("url") or "").strip()
+            if url and url not in seen and r.get("snippet"):
+                # snippets are evidence too - they often carry the answer
+                sources.append({"title": r.get("title", ""), "url": url,
+                                "text": r["snippet"]})
+            if len(read) >= max(1, int(read_pages)):
+                continue
             if not url or url in seen:
                 continue
             try:
@@ -115,29 +116,30 @@ class AnswerQuestion(Tool):
         claim = ans["extract"] if ans else question
         v = verify_claim(claim, sources)
 
-        out = []
+        # ONE line first - that is what the chat shows.
+        one = short_answer(question, sources)
+        if not one:
+            one = ans.get("title", "") if ans else (
+                web_results[0]["title"] if web_results else "(no answer found)")
+
+        out = [one, "---"]
         if ans:
-            out.append(f"ANSWER: {ans.get('title', '')}")
-            out.append(f"SOURCE: {ans.get('url', '')}")
+            out.append(f"source: {ans.get('url', '')}")
             if ans.get("timestamp"):
-                out.append(f"LAST EDITED: {ans['timestamp']}")
+                out.append(f"last edited: {ans['timestamp']}")
             out.append("")
             out.append(ans.get("extract", ""))
-        else:
-            out.append("No encyclopedic answer found. Closest web results:")
-            for r in web_results[:5]:
-                out.append(f"- {r.get('title','')} {r.get('url','')}")
-        if read:
-            out.append("")
-            out.append("ALSO READ (whole web): " + "; ".join(
-                f"{x['title']} <{x['url']}>" for x in read))
-        if web_results:
+        elif web_results:
             out.append("")
             out.append("TOP WEB RESULTS:")
             for r in web_results[:5]:
                 out.append(f"- {r.get('title','')} <{r.get('url','')}>")
                 if r.get("snippet"):
                     out.append(f"    {r['snippet'][:200]}")
+        if read:
+            out.append("")
+            out.append("ALSO READ: " + "; ".join(
+                f"{x['title']} <{x['url']}>" for x in read))
         out.append("")
         out.append(f"CONFIDENCE: {v.confidence} (agreement {v.score:.2f})")
         if v.support:
@@ -150,8 +152,7 @@ class AnswerQuestion(Tool):
             out.append("engines tried and failed: " + ", ".join(
                 f["engine"] for f in fallbacks))
         if len(sources) < 2:
-            out.append("NOTE: only one source agreed - treat as unconfirmed. "
-                       "Attach a model backend to reason across more sources.")
+            out.append("NOTE: only one source agreed - treat as unconfirmed.")
         return "\n".join(out)
 
 

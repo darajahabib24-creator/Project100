@@ -52,6 +52,8 @@ def make_parser():
                    help="disable the animated spinner (keeps the step log)")
     p.add_argument("-i", "--interactive", action="store_true",
                    help="stay in a chat loop: ask more than one question")
+    p.add_argument("--once", action="store_true",
+                   help="answer one goal and exit (no chat loop)")
     p.add_argument("--dump", help="write the finished transcript to this JSON")
     return p
 
@@ -98,8 +100,23 @@ def _select_model(args):
     return make_model(args.model, target=args.model_module, url=args.model_url)
 
 
-def run_interactive(agent, spinner, first_goal, quiet=False):
-    """Chat loop: the agent keeps working and stays open for follow-ups.
+def one_line(text: str) -> str:
+    """The answer is everything before the '---' separator."""
+    return text.split("\n---", 1)[0].strip()
+
+
+def last_answer(agent) -> str:
+    """Pull the one-line answer out of the last answer_question result."""
+    for m in reversed(agent.history):
+        if m.role == "tool" and m.name == "answer_question":
+            line = one_line(m.content)
+            if line:
+                return line
+    return ""
+
+
+def run_interactive(agent, spinner, first_goal, quiet=False, show_log=False):
+    """Chat loop: thinking -> working -> one-line answer -> stay open.
 
     The transcript is NOT reset between turns, so the agent remembers what you
     asked earlier. Type quit / exit / q, or press Ctrl-D / Ctrl-C, to leave.
@@ -118,8 +135,7 @@ def run_interactive(agent, spinner, first_goal, quiet=False):
         if not goal:
             goal = None
             continue
-        low = goal.lower()
-        if low in ("quit", "exit", "q", "bye", "exit()"):
+        if goal.lower() in ("quit", "exit", "q", "bye", "exit()"):
             print("bye")
             return 0
 
@@ -139,10 +155,18 @@ def run_interactive(agent, spinner, first_goal, quiet=False):
             agent.model_error = None
             goal = None
             continue
-        if not quiet:
+
+        ans = last_answer(agent)
+        if ans:
+            print(f"\n{ans}\n")
+        elif not show_log:
+            final = [m.content for m in agent.history if m.role == "assistant"]
+            if final:
+                print(f"\n{one_line(final[-1])}\n")
+        if show_log and not quiet:
             n_tools = sum(len(s.calls) for s in steps)
-            print(f"\n✓ {time.time() - t0:.1f}s · {len(steps)} step(s) · "
-                  f"{n_tools} tool call(s)\n")
+            print(f"✓ {time.time() - t0:.1f}s · {len(steps)} step(s) · "
+                  f"{n_tools} tool call(s)")
         goal = None
 
 
@@ -154,7 +178,10 @@ def main(argv=None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    if args.interactive and not args.goal and not args.replay:
+    # Chat is the default when attached to a terminal; --once forces single-shot.
+    interactive = args.interactive or (not args.once and sys.stdin.isatty())
+
+    if interactive and not args.goal and not args.replay:
         pass  # interactive with no opening goal just starts the prompt
     elif not args.goal and not args.replay:
         # No goal: show how to use it rather than a bare error.
@@ -175,10 +202,12 @@ def main(argv=None) -> int:
 
     spinner = Spinner(enabled=False if (args.quiet or args.no_spin) else None)
     agent = Agent(model, bus, memory, max_steps=args.max_steps,
-                  verbose=not args.quiet, spinner=spinner)
+                  verbose=not args.quiet and not interactive,
+                  spinner=spinner)
 
-    if args.interactive:
-        return run_interactive(agent, spinner, args.goal, quiet=args.quiet)
+    if interactive:
+        return run_interactive(agent, spinner, args.goal, quiet=args.quiet,
+                               show_log=args.quiet)
 
     t0 = time.time()
     spinner.start()

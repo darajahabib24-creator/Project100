@@ -66,9 +66,10 @@ class RulePolicy(Model):
 
     def _verify_turn(self, goal: str, prompt: str) -> str:
         """Search for the claim, read the top page, then score agreement."""
-        searched = "[tool:web_search]" in prompt
-        browsed = "[tool:browse_url]" in prompt
-        verified = "[tool:verify_answer]" in prompt
+        turn = self._turn(prompt)
+        searched = "[tool:web_search]" in turn
+        browsed = "[tool:browse_url]" in turn
+        verified = "[tool:verify_answer]" in turn
 
         if verified:
             return ("Verdict: " + self._verdict_from_transcript(prompt) +
@@ -135,6 +136,17 @@ class RulePolicy(Model):
             url = um.group(1)
         return json.dumps([{"title": title, "url": url, "text": body[:2500]}])
 
+    @staticmethod
+    def _turn(prompt: str) -> str:
+        """Only the CURRENT question's part of the transcript.
+
+        The prompt embeds the whole history, so a naive `in prompt` check makes
+        a persistent chat think it already did this turn's work. Everything
+        after the last [user] line belongs to the current question.
+        """
+        i = prompt.rfind("[user]")
+        return prompt[i:] if i >= 0 else prompt
+
     def _fix_turn(self, goal: str, prompt: str) -> str:
         """Read -> reproduce (run it) -> search the web for the error -> report.
 
@@ -142,9 +154,10 @@ class RulePolicy(Model):
         a grounded diagnosis: the real traceback plus the top web references.
         Attaching a model is what turns this into an actual patch.
         """
-        searched = "[tool:web_search]" in prompt
-        ran = "[tool:shell]" in prompt
-        read_files = "[tool:read_file]" in prompt
+        turn = self._turn(prompt)
+        searched = "[tool:web_search]" in turn
+        ran = "[tool:shell]" in turn
+        read_files = "[tool:read_file]" in turn
 
         m = ANY_FILE_RE.search(goal)
         path = m.group(1) if m else ""
@@ -199,6 +212,8 @@ class RulePolicy(Model):
         if m:
             goal = m[0].strip()
 
+        turn = self._turn(prompt)
+
         # What has actually been read? read_file results are numbered lines, so
         # detect repeats by counting successful read_file turns in the transcript.
         read_turns = prompt.count("[tool:read_file]")
@@ -227,12 +242,12 @@ class RulePolicy(Model):
         # A question: answer it from a cited source first, and if the answer is
         # not encyclopedic, search the web.
         if question_m:
-            if "[tool:answer_question]" not in prompt and \
-                    "[tool:web_search]" not in prompt:
+            if "[tool:answer_question]" not in turn and \
+                    "[tool:web_search]" not in turn:
                 return ("I will look this up and cite the source.\n"
                         + _call("answer_question", question=goal,
                                 read_page=True))
-            if "[tool:answer_question]" in prompt and "[tool:browse_url]" not in prompt:
+            if "[tool:answer_question]" in turn and "[tool:browse_url]" not in turn:
                 url = self._first_url(prompt)
                 if not url:
                     return ("The web sources were inconclusive; the task is "
@@ -242,7 +257,7 @@ class RulePolicy(Model):
             return "I have the sourced answer; the task is complete."
 
         # "remember that X is Y" -> store key X, value Y in memory.
-        if remember_m and "[tool:memory_put]" not in prompt:
+        if remember_m and "[tool:memory_put]" not in turn:
             fact = remember_m.group(1).strip().rstrip(".,;")
             # split on the first " is " / " are " / "=" separator, case-insensitive
             sep = re.search(r"\s+(?:is|are|was|were)\s+|[:=]\s*", fact, re.I)

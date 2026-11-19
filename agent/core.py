@@ -416,7 +416,7 @@ class Agent:
 
         for n in range(1, self.max_steps + 1):
             prompt = self._build_prompt(goal, planner)
-            self._spin(f"thinking  [step {n}/{self.max_steps}]")
+            self._spin("thinking .....")
             try:
                 reply = self.model.generate(prompt)
             except Exception as exc:  # noqa: BLE001
@@ -453,7 +453,7 @@ class Agent:
             self._say(f"[{n}] {len(calls)} call(s): " +
                       ", ".join(c["tool"] for c in calls))
             for call in calls:
-                self._spin(f"{call['tool']}  [step {n}]")
+                self._spin(f"working ..... {call['tool']}")
                 try:
                     result = self.bus.call(call["tool"], call["args"])
                     step.results.append(result)
