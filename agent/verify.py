@@ -107,26 +107,22 @@ def verify_claim(claim: str, sources: list[dict]) -> Verification:
     agreeing = [s for sc, s, _ in scored if sc >= max(0.35, top * 0.6)]
     weak = [s for sc, s, _ in scored if sc < max(0.35, top * 0.6)]
 
-    # numeric contradiction: a number in the claim absent from a source that
-    # talks about the same subject
-    contradictions = []
-    for sc, s, inter in scored[:3]:
-        if not inter:
-            continue
-        src_nums = set(re.findall(r"\b\d[\d,]*(?:\.\d+)?%?\b", s.get("text", "")))
-        missing = claim_nums - src_nums
-        if claim_nums and missing and sc < 0.6:
-            contradictions.append(s)
-
+    # Numeric note: a number in the claim absent from an agreeing source is
+    # worth flagging, but it is not a contradiction of the claim - only note it.
     notes = []
     if len(agreeing) == 1:
         notes.append("only one source agrees; treat as unconfirmed")
-    if contradictions:
-        notes.append("numeric values differ across sources")
+    if claim_nums:
+        for sc, s, inter in scored[:3]:
+            if not inter:
+                continue
+            src_nums = set(re.findall(r"\b\d[\d,]*(?:\.\d+)?%?\b", s.get("text", "")))
+            if claim_nums - src_nums:
+                notes.append("some numbers in the claim are not in "
+                             f"{s.get('title','that source')}")
+                break
 
-    if contradictions:
-        conf = "contradicted"
-    elif top >= 0.6 and len(agreeing) >= 2:
+    if top >= 0.6 and len(agreeing) >= 2:
         conf = "high"
     elif top >= 0.35:
         conf = "medium"
@@ -138,5 +134,5 @@ def verify_claim(claim: str, sources: list[dict]) -> Verification:
     support = [f"{s.get('title', s.get('url', ''))} <{s.get('url', '')}>"
                for s in agreeing]
     against = [f"{s.get('title', s.get('url', ''))} <{s.get('url', '')}>"
-               for s in contradictions + weak]
+               for s in weak]
     return Verification(claim, conf, round(top, 3), support, against, notes)

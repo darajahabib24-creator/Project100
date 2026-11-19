@@ -185,7 +185,10 @@ class RulePolicy(Model):
     def _first_url(self, prompt: str) -> str:
         """First SOURCE: URL from an answer_question result in the transcript."""
         m = re.search(r"^SOURCE:\s*(https?://\S+)", prompt, re.M)
-        return m.group(1) if m else "https://en.wikipedia.org"
+        if m:
+            return m.group(1)
+        m = re.search(r"^\d+\.\s+.+\n\s+(https?://\S+)", prompt, re.M)
+        return m.group(1) if m else ""
 
     def generate(self, prompt: str, max_tokens: int = 512) -> str:
         self.calls_made += 1
@@ -230,8 +233,12 @@ class RulePolicy(Model):
                         + _call("answer_question", question=goal,
                                 read_page=True))
             if "[tool:answer_question]" in prompt and "[tool:browse_url]" not in prompt:
+                url = self._first_url(prompt)
+                if not url:
+                    return ("The web sources were inconclusive; the task is "
+                            "complete.")
                 return "I will read the top source page to confirm.\n" + \
-                    _call("browse_url", url=self._first_url(prompt), max_chars=2000)
+                    _call("browse_url", url=url, max_chars=2000)
             return "I have the sourced answer; the task is complete."
 
         # "remember that X is Y" -> store key X, value Y in memory.

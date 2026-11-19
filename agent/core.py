@@ -406,9 +406,12 @@ class Agent:
         parts.append(f"Goal: {goal}\nRespond now.")
         return "\n".join(parts)
 
-    def run(self, goal: str) -> list[Step]:
+    def run(self, goal: str, reset: bool = True) -> list[Step]:
         planner = Planner(goal)
-        self.history = [Message("user", goal)]
+        if reset or not self.history:
+            self.history = [Message("user", goal)]
+        else:
+            self.history.append(Message("user", goal))
         self._say(f"[goal] {goal}")
 
         for n in range(1, self.max_steps + 1):
@@ -455,7 +458,7 @@ class Agent:
                     result = self.bus.call(call["tool"], call["args"])
                     step.results.append(result)
                     self.history.append(Message("tool", result, name=call["tool"]))
-                    self._say(f"    -> {call['tool']}: {result[:300]}")
+                    self._say(f"    -> {call['tool']}: {result[:2000]}")
                 except ToolError as exc:
                     step.error = str(exc)
                     self.history.append(Message("tool", str(exc), name=call["tool"]))

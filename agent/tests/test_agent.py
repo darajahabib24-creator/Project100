@@ -973,6 +973,92 @@ def test_no_goal_shows_help_not_error():
     assert "required" not in r.stderr
 
 
+# --------------------------------------------------------------------------- #
+# Whole-web answers + interactive chat
+# --------------------------------------------------------------------------- #
+
+def test_opinion_questions_are_not_encyclopedic():
+    from agent.search import is_encyclopedic
+    assert is_encyclopedic("what is the capital of France") is True
+    assert is_encyclopedic("who wrote Hamlet") is True
+    for q in ("what is the best linux distro", "top 10 python books",
+              "is rust worth it", "macbook vs thinkpad", "cheapest vps"):
+        assert is_encyclopedic(q) is False, q
+
+
+def test_answer_question_uses_whole_web(tmp_path, monkeypatch):
+    """answer_question must search the web AND read pages, not just Wikipedia."""
+    from agent import search, browse
+    monkeypatch.setattr(search, "_get", lambda *a, **k: json.dumps({
+        "title": "Paris", "extract": "Paris is the capital of France.",
+        "content_urls": {"desktop": {"page": "https://en.wikipedia.org/wiki/Paris"}},
+        "timestamp": "2026-01-01T00:00:00Z"}))
+    monkeypatch.setattr(search, "ddg_lite", lambda q, count=10: [
+        {"url": "https://example.com/paris", "title": "Paris guide",
+         "snippet": "Paris is the capital of France and its largest city.",
+         "engine": "ddg-lite"}])
+    monkeypatch.setattr(browse, "fetch",
+                        lambda url, timeout=20: (url, PAGE_HTML))
+    bus = make_bus()
+    out = bus.call("answer_question", {"question": "what is the capital of France"})
+    assert "TOP WEB RESULTS" in out
+    assert "example.com/paris" in out
+    assert "CONFIDENCE:" in out
+
+
+def test_answer_question_notes_single_source(tmp_path):
+    bus = make_bus()
+    out = bus.call("answer_question", {"question": "what is the capital of France"})
+    assert "CONFIDENCE:" in out
+
+
+def test_interactive_loop_asks_twice_and_quits():
+    """Regression: -i must stay open for multiple questions and exit on quit."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    import subprocess
+    inp = "create a file called c1.md\ncreate a file called c2.md\nquit\n"
+    r = subprocess.run([sys.executable, "agent/cli.py", "-i", "--no-memory",
+                        "--quiet", "--cwd", repo],
+                       cwd=repo, input=inp, capture_output=True, text=True,
+                       timeout=180)
+    assert r.returncode == 0, r.stderr
+    assert os.path.exists(os.path.join(repo, "c1.md"))
+    assert os.path.exists(os.path.join(repo, "c2.md"))
+    for f in ("c1.md", "c2.md"):
+        os.remove(os.path.join(repo, f))
+
+
+def test_interactive_exit_words():
+    from agent.cli import run_interactive
+
+    class FakeSpinner:
+        def start(self): pass
+        def stop(self): pass
+
+    class FakeAgent:
+        def __init__(self): self.seen = []
+        def run(self, goal, reset=True):
+            self.seen.append(goal); return []
+
+    for word in ("quit", "exit", "q", "bye"):
+        ag = FakeAgent()
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run_interactive(ag, FakeSpinner(), None) if False else None
+        # feed the word as the first input
+        import builtins
+        real_input = builtins.input
+        builtins.input = lambda prompt="": word
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_interactive(ag, FakeSpinner(), None)
+        finally:
+            builtins.input = real_input
+        assert rc == 0 and ag.seen == [], word
+
+
 if __name__ == "__main__":
     import tempfile
     from pathlib import Path

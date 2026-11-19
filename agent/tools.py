@@ -15,7 +15,7 @@ from typing import Any
 from .core import Tool, ToolError
 from .browse import BrowseError, browse, format_page
 from .search import (SearchError, direct_answer, format_answer, format_results,
-                     web_search)
+                     is_encyclopedic, web_search)
 from .verify import verify_claim
 
 
@@ -61,30 +61,98 @@ class VerifyAnswer(Tool):
 
 class AnswerQuestion(Tool):
     name = "answer_question"
-    description = ("Answer a factual question with a cited source. Uses "
-                   "Wikipedia summaries and the open web. Returns provenance "
-                   "(URL + last-edited date) with the answer.")
+    description = ("Answer a question from the whole web, not just Wikipedia: "
+                   "searches, reads several result pages, then scores agreement "
+                   "and returns a confidence label with citations.")
     params = {"question": "the question to answer",
-              "read_page": "also read the source page (true/false)"}
+              "read_pages": "how many result pages to read (default 2)",
+              "read_page": "kept for compatibility; also read the top source"}
 
-    def run(self, question: str, read_page: bool = False) -> str:
-        ans = direct_answer(question)
-        if not ans:
-            try:
-                res = web_search(question, count=5)
-            except SearchError as exc:
+    def run(self, question: str, read_pages: int = 2, read_page: bool = True) -> str:
+        sources: list[dict] = []
+        encyclopedic = is_encyclopedic(question)
+        ans = direct_answer(question) if encyclopedic else {}
+        if ans:
+            sources.append({"title": ans.get("title", ""),
+                            "url": ans.get("url", ""),
+                            "text": ans.get("extract", "")[:4000]})
+
+        # Search the open web. For opinion questions, skip Wikipedia entirely
+        # and use the general engines so review/comparison sites rank.
+        try:
+            engines = None if encyclopedic else ["ddg-lite", "mojeek", "brave", "wikipedia"]
+            res = web_search(question, count=8, engines=engines)
+            web_results = res.get("results", [])
+            engine = res.get("engine", "?")
+            fallbacks = res.get("fallbacks", [])
+        except SearchError as exc:
+            if not sources:
                 raise ToolError(str(exc)) from exc
-            out = ["No direct encyclopedic answer. Top web results:"]
-            out.append(format_results(res, limit=5))
-            return "\n".join(out)
-        out = format_answer(ans)
-        if read_page:
+            web_results, engine, fallbacks = [], "wikipedia", []
+
+        # Read the top result pages so the answer is checked against real pages.
+        seen = {s["url"] for s in sources if s["url"]}
+        read = []
+        for r in web_results:
+            if len(read) >= max(1, int(read_pages)):
+                break
+            url = (r.get("url") or "").strip()
+            if not url or url in seen:
+                continue
             try:
-                page = browse(ans["url"])
-                out += "\n\n--- PAGE LEAD ---\n" + page["text"][:1500]
+                page = browse(url)
             except BrowseError:
-                pass
-        return out
+                continue
+            body = page["text"][:4000]
+            sources.append({"title": page.get("title", r.get("title", "")),
+                            "url": url, "text": body})
+            read.append({"title": page.get("title", ""), "url": url})
+            seen.add(url)
+
+        if not sources:
+            raise ToolError("no sources found for that question")
+
+        claim = ans["extract"] if ans else question
+        v = verify_claim(claim, sources)
+
+        out = []
+        if ans:
+            out.append(f"ANSWER: {ans.get('title', '')}")
+            out.append(f"SOURCE: {ans.get('url', '')}")
+            if ans.get("timestamp"):
+                out.append(f"LAST EDITED: {ans['timestamp']}")
+            out.append("")
+            out.append(ans.get("extract", ""))
+        else:
+            out.append("No encyclopedic answer found. Closest web results:")
+            for r in web_results[:5]:
+                out.append(f"- {r.get('title','')} {r.get('url','')}")
+        if read:
+            out.append("")
+            out.append("ALSO READ (whole web): " + "; ".join(
+                f"{x['title']} <{x['url']}>" for x in read))
+        if web_results:
+            out.append("")
+            out.append("TOP WEB RESULTS:")
+            for r in web_results[:5]:
+                out.append(f"- {r.get('title','')} <{r.get('url','')}>")
+                if r.get("snippet"):
+                    out.append(f"    {r['snippet'][:200]}")
+        out.append("")
+        out.append(f"CONFIDENCE: {v.confidence} (agreement {v.score:.2f})")
+        if v.support:
+            out.append("SUPPORTED BY: " + "; ".join(v.support[:3]))
+        if v.against:
+            out.append("WEAK/OTHER: " + "; ".join(v.against[:2]))
+        if engine and engine != "wikipedia":
+            out.append(f"search engine: {engine}")
+        if fallbacks:
+            out.append("engines tried and failed: " + ", ".join(
+                f["engine"] for f in fallbacks))
+        if len(sources) < 2:
+            out.append("NOTE: only one source agreed - treat as unconfirmed. "
+                       "Attach a model backend to reason across more sources.")
+        return "\n".join(out)
 
 
 class BrowseURL(Tool):

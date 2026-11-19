@@ -117,6 +117,30 @@ def ddg_lite(query: str, count: int = 10) -> list[dict]:
     return results
 
 
+def mojeek(query: str, count: int = 10) -> list[dict]:
+    """Mojeek - independent web index, plain HTML, no key, generous limits."""
+    url = "https://www.mojeek.com/search?" + urllib.parse.urlencode({"q": query})
+    body = _get(url, headers={"Accept": "text/html"})
+    if len(body) < MIN_BODY:
+        raise SearchError("mojeek: suspiciously short body")
+    results = []
+    # result blocks: <a class="title" href="URL">TITLE</a> ... <p class="s">SNIP</p>
+    for m in re.finditer(
+            r'<a[^>]+class="title"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', body, re.S):
+        href, title = m.group(1), _strip_tags(m.group(2))
+        if not _valid(href) or len(title) < 5:
+            continue
+        tail = body[m.end():m.end() + 600]
+        sm = re.search(r'<p class="s">(.*?)</p>', tail, re.S)
+        snip = _strip_tags(sm.group(1)) if sm else ""
+        results.append(_result(href, title, snip, "mojeek"))
+        if len(results) >= count:
+            break
+    if not results:
+        raise SearchError("mojeek: no results parsed")
+    return results
+
+
 def brave_html(query: str, count: int = 10) -> list[dict]:
     """Brave search HTML. No key, but the markup shifts; parse defensively."""
     url = "https://search.brave.com/search?" + urllib.parse.urlencode(
@@ -249,16 +273,31 @@ def _strip_tags(text: str) -> str:
 # --------------------------------------------------------------------------- #
 
 def is_encyclopedic(query: str) -> bool:
-    """Cheap router: should this query go to Wikipedia first?"""
+    """Should this query go to Wikipedia first?
+
+    Only genuinely factual, definitional questions. Opinion, comparison,
+    recommendation and current-event questions belong to the open web, where
+    there are multiple sources to cross-check.
+    """
     q = query.lower()
-    head = r"^(what|who|when|where|why|how|which|define|explain|list of)\b"
-    return bool(re.search(head, q)) or any(
-        w in q for w in ("definition", "history of", "wikipedia", "named after"))
+    # these are web questions, not encyclopedia questions
+    opinion = ("best", "worst", "top ", "top 10", " vs ", "versus", "review",
+               "recommend", "which should", "is it worth", "worth it",
+               "cheapest", "fastest", "easiest", "alternative to", "like ",
+               "opinion", "rating", "price", "buy", "deals", "news today")
+    if any(w in q for w in opinion):
+        return False
+    head = r"^(what|who|when|where|why|how|which|whose)\b"
+    if re.search(head, q):
+        return True
+    return any(w in q for w in ("definition", "history of", "wikipedia",
+                                "named after"))
 
 
 # Maps engine name -> module-level function name, resolved at call time so
 # tests (and callers) can monkeypatch the module attribute.
-ENGINES = {"ddg-lite": "ddg_lite", "brave": "brave_html", "wikipedia": "wikipedia"}
+ENGINES = {"ddg-lite": "ddg_lite", "brave": "brave_html",
+           "wikipedia": "wikipedia", "mojeek": "mojeek"}
 
 
 def _engine(name: str):
@@ -277,11 +316,12 @@ def web_search(query: str, count: int = 10, engines: list[str] | None = None,
     if not query:
         raise SearchError("empty query")
 
-    order = engines or ["ddg-lite", "brave", "wikipedia"]
+    order = engines or ["ddg-lite", "mojeek", "brave", "wikipedia"]
     if is_encyclopedic(query):
         order = ["wikipedia"] + [e for e in order if e != "wikipedia"]
 
     fallbacks, last_err = [], None
+    retried: set[str] = set()
     for name in order:
         fn = _engine(name)
         if fn is None:
@@ -291,6 +331,21 @@ def web_search(query: str, count: int = 10, engines: list[str] | None = None,
             res = fn(query, count=count)
             return {"query": query, "engine": name, "results": res,
                     "fallbacks": fallbacks}
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 503) and name not in retried:
+                # rate-limited or briefly unavailable: wait, retry once
+                retried.add(name)
+                time.sleep(3.0)
+                try:
+                    res = fn(query, count=count)
+                    return {"query": query, "engine": name, "results": res,
+                            "fallbacks": fallbacks}
+                except Exception as exc2:  # noqa: BLE001
+                    fallbacks.append({"engine": name,
+                                      "error": f"{type(exc2).__name__}: {exc2}"})
+            else:
+                fallbacks.append({"engine": name,
+                                  "error": f"{type(exc).__name__}: {exc}"})
         except (SearchError, urllib.error.URLError, OSError, Exception) as exc:
             fallbacks.append({"engine": name, "error": f"{type(exc).__name__}: {exc}"})
             last_err = exc

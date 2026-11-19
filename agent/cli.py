@@ -50,6 +50,8 @@ def make_parser():
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--no-spin", action="store_true",
                    help="disable the animated spinner (keeps the step log)")
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="stay in a chat loop: ask more than one question")
     p.add_argument("--dump", help="write the finished transcript to this JSON")
     return p
 
@@ -96,6 +98,54 @@ def _select_model(args):
     return make_model(args.model, target=args.model_module, url=args.model_url)
 
 
+def run_interactive(agent, spinner, first_goal, quiet=False):
+    """Chat loop: the agent keeps working and stays open for follow-ups.
+
+    The transcript is NOT reset between turns, so the agent remembers what you
+    asked earlier. Type quit / exit / q, or press Ctrl-D / Ctrl-C, to leave.
+    """
+    print("agent - ask anything. 'quit' to exit.")
+    print("-" * 60)
+    goal = first_goal
+    first = True
+    while True:
+        if goal is None:
+            try:
+                goal = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nbye")
+                return 0
+        if not goal:
+            goal = None
+            continue
+        low = goal.lower()
+        if low in ("quit", "exit", "q", "bye", "exit()"):
+            print("bye")
+            return 0
+
+        t0 = time.time()
+        spinner.start()
+        try:
+            steps = agent.run(goal, reset=first)
+        except RuntimeError as exc:
+            print(f"error: {exc}")
+            goal = None
+            continue
+        finally:
+            spinner.stop()
+        first = False
+        if agent.model_error:
+            print(f"error: model failed: {agent.model_error}")
+            agent.model_error = None
+            goal = None
+            continue
+        if not quiet:
+            n_tools = sum(len(s.calls) for s in steps)
+            print(f"\n✓ {time.time() - t0:.1f}s · {len(steps)} step(s) · "
+                  f"{n_tools} tool call(s)\n")
+        goal = None
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     try:
@@ -104,10 +154,13 @@ def main(argv=None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    if not args.goal and not args.replay:
+    if args.interactive and not args.goal and not args.replay:
+        pass  # interactive with no opening goal just starts the prompt
+    elif not args.goal and not args.replay:
         # No goal: show how to use it rather than a bare error.
         make_parser().print_help()
         print("\nexample: agent \"what is the speed of light\"")
+        print("         agent -i          (chat mode, stays open)")
         return 0
     goal = args.goal or "replay"
 
@@ -123,6 +176,10 @@ def main(argv=None) -> int:
     spinner = Spinner(enabled=False if (args.quiet or args.no_spin) else None)
     agent = Agent(model, bus, memory, max_steps=args.max_steps,
                   verbose=not args.quiet, spinner=spinner)
+
+    if args.interactive:
+        return run_interactive(agent, spinner, args.goal, quiet=args.quiet)
+
     t0 = time.time()
     spinner.start()
     try:

@@ -103,23 +103,45 @@ All local except the web tools. No tool uses an API key.
 
 Web: `web_search`, `answer_question`, `verify_answer`, `browse_url`, `fetch_url`.
 
+## Chat mode (it stays open)
+
+```
+agent -i
+```
+
+The agent keeps running and keeps its context, so you can ask follow-ups:
+
+```
+agent -i
+> what is the capital of France
+... works, answers ...
+> and what is its population
+... remembers the last question ...
+> quit
+```
+
+Type `quit`, `exit`, `q` or `bye`, or press Ctrl-D / Ctrl-C to leave. Add a goal
+to start somewhere: `agent -i "what is the speed of light"`.
+
 ## The web: find things and get right answers
 
 Three stages, and the agent uses them from the default policy with no weights:
 
-1. **Find** - `web_search` queries the open web with no key. It tries
-   DuckDuckGo Lite, then Brave, then Wikipedia, and records which engines
-   failed so you can see provenance. Encyclopedic questions
-   ("what is X", "who wrote Y") route to Wikipedia first.
+1. **Find** - `web_search` queries the open web with no key: DuckDuckGo Lite,
+   Mojeek, Brave, then Wikipedia. Which engines failed is reported, so you can
+   see provenance. Factual questions ("what is X", "who wrote Y") start at
+   Wikipedia; opinion and comparison questions ("best...", "vs", "cheapest")
+   go straight to the general web.
 2. **Read** - `browse_url` fetches a page and reduces it to readable text
    (stdlib HTML pass, no headless browser). It rejects pages that yield almost
    no text, which is how bot walls and JS-only sites announce themselves.
 3. **Verify** - `verify_answer` scores a claim against the pages actually read
-   and returns a confidence label (`high`/`medium`/`low`/`contradicted`/
-   `unverified`) plus which sources support or contradict it.
+   and returns a confidence label (`high`/`medium`/`low`/`unverified`) plus
+   which sources support or contradict it.
 
-`answer_question` combines 1+2 and returns the answer **with its source URL and
-last-edited date**. It never presents a snippet as the answer.
+`answer_question` does all three: Wikipedia candidate + web search + reads the
+top result pages, then reports the answer, the top web results with snippets,
+and a confidence label. It never presents a snippet as the answer.
 
 ```bash
 agent "what is the speed of light"                 # cited answer + reads the page
