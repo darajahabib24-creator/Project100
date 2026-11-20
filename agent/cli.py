@@ -105,9 +105,9 @@ def one_line(text: str) -> str:
     return text.split("\n---", 1)[0].strip()
 
 
-def last_answer(agent) -> str:
-    """Pull the one-line answer out of the last answer_question result."""
-    for m in reversed(agent.history):
+def last_answer(agent, start: int = 0) -> str:
+    """One-line answer from the tool results added during THIS turn."""
+    for m in reversed(agent.history[start:]):
         if m.role == "tool" and m.name == "answer_question":
             line = one_line(m.content)
             if line:
@@ -140,6 +140,9 @@ def run_interactive(agent, spinner, first_goal, quiet=False, show_log=False):
             return 0
 
         t0 = time.time()
+        n0 = len(agent.history)      # only look at this turn's results
+        if hasattr(agent.model, "reset_turn"):
+            agent.model.reset_turn()
         spinner.start()
         try:
             steps = agent.run(goal, reset=first)
@@ -156,7 +159,7 @@ def run_interactive(agent, spinner, first_goal, quiet=False, show_log=False):
             goal = None
             continue
 
-        ans = last_answer(agent)
+        ans = last_answer(agent, n0)
         if ans:
             print(f"\n{ans}\n")
         elif not show_log:

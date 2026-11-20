@@ -328,6 +328,26 @@ def bing(query: str, count: int = 10) -> list[dict]:
     return results
 
 
+ATTRS = ("capital", "capital city", "population", "president", "prime minister",
+         "currency", "language", "languages", "continent", "government", "leader",
+         "king", "queen", "flag", "anthem", "largest city", "area", "founder",
+         "inventor", "author", "director")
+
+
+def normalize_query(q: str) -> str:
+    """Turn a bare query into a question: 'capital france' -> 'capital of France'.
+
+    Users type fragments in a chat. Without this the extractor cannot match a
+    'capital of X is Y' pattern and the answer comes back empty or wrong.
+    """
+    words = q.strip().split()
+    if len(words) < 2 or " of " in q:
+        return q
+    if words[0].lower() in ATTRS:
+        return " ".join([words[0], "of"] + words[1:])
+    return q
+
+
 def short_answer(question: str, sources: list[dict], limit: int = 120) -> str:
     """Reduce sources to ONE line - the answer, not the story.
 
@@ -335,7 +355,7 @@ def short_answer(question: str, sources: list[dict], limit: int = 120) -> str:
     then cut it at the first clause boundary. Falls back to the sentence with
     the most question overlap.
     """
-    q = question.strip().lower()
+    q = normalize_query(question).strip().lower()
     attr = subj = ""
     m = re.search(r"\bwhat(?: is|'s| are)\s+the\s+(.+?)\s+of\s+(.+?)\s*\??\s*$", q)
     if m:                                    # "what is the capital of France"
@@ -346,11 +366,18 @@ def short_answer(question: str, sources: list[dict], limit: int = 120) -> str:
                       r"(.+?)\s*\??\s*$", q)
         if m:
             attr = m.group(2)
+        else:
+            # bare fragment: "capital of France"
+            m = re.search(r"^([a-z][a-z ]*?)\s+of\s+([a-z][a-z ]*?)$", q)
+            if m and m.group(1).strip() in ATTRS:
+                attr, subj = m.group(1).strip(), m.group(2).strip()
 
     def sentences(text: str):
         return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
 
     def clean(cand: str) -> str:
+        cand = re.sub(r"\[[^\]]*\]", " ", cand)      # drop [url] link markers
+        cand = re.sub(r"\s+", " ", cand).strip()
         cand = re.split(r"\s+-\s+", cand)[0].strip()
         # A definition ("a high-level, general-purpose language") keeps its
         # commas; anything else is cut at the first comma for brevity.
@@ -363,6 +390,8 @@ def short_answer(question: str, sources: list[dict], limit: int = 120) -> str:
 
     for s in sources:
         for sent in sentences(s.get("text", "")):
+            if sent.endswith("?"):
+                continue                      # a question is not an answer
             low = sent.lower()
             # 1. "the capital of France is Paris"
             if attr and subj:
@@ -377,7 +406,7 @@ def short_answer(question: str, sources: list[dict], limit: int = 120) -> str:
                 mm = re.search(r"([a-z][^.,;]*?)\s+is\s+(?:the\s+|a\s+|an\s+)?" +
                                re.escape(attr) +
                                r"(?:\s+(?:and|or)\s+[a-z]+)*" +
-                               r"(?:\s+of\s+" + re.escape(subj) + r")?\s*[.,]",
+                               r"(?:\s+of\s+" + re.escape(subj) + r")?",
                                low)
                 if mm:
                     got = clean(re.sub(r"\[[^\]]*\]", "", sent[mm.start(1):mm.end(1)]))
@@ -414,27 +443,9 @@ def short_answer(question: str, sources: list[dict], limit: int = 120) -> str:
                                r"painted|designed) by ([A-Z][A-Za-z.'-]+"
                                r"(?:\s+[A-Z][A-Za-z.'-]+){0,2})", sent)
                 if pm:
-                    return pm.group(1)
+                    return pm.group(1).rstrip(" .;,")
 
-    # 2. best-overlap sentence, trimmed
-    best, best_score = "", -1.0
-    for s in sources:
-        for sent in sentences(s.get("text", "")):
-            if len(sent) < 12:
-                continue
-            stoks = set(tokens(sent))
-            if not stoks:
-                continue
-            score = len(qtoks & stoks) / len(qtoks | stoks)
-            if score > best_score:
-                best, best_score = sent, score
-    if best:
-        return best[:limit].rstrip(" .;,")
-
-    # 3. last resort: first source's title
-    for s in sources:
-        if s.get("title"):
-            return s["title"][:limit]
+    # 2. no confident match - say so rather than guess
     return ""
 
 

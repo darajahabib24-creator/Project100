@@ -15,7 +15,7 @@ from typing import Any
 from .core import Tool, ToolError
 from .browse import BrowseError, browse, format_page
 from .search import (SearchError, direct_answer, format_answer, format_results,
-                     is_encyclopedic, short_answer, web_search)
+                     is_encyclopedic, normalize_query, short_answer, web_search)
 from .verify import verify_claim
 
 
@@ -69,8 +69,10 @@ class AnswerQuestion(Tool):
               "read_page": "kept for compatibility; also read the top source"}
 
     def run(self, question: str, read_pages: int = 2, read_page: bool = True) -> str:
+        # "capital france" -> "capital of France" so the extractor can match
+        q = normalize_query(question)
         sources: list[dict] = []
-        encyclopedic = is_encyclopedic(question)
+        encyclopedic = is_encyclopedic(q)
         ans: dict = {}      # Wikipedia is not used - the open web only
         if ans:
             sources.append({"title": ans.get("title", ""),
@@ -80,7 +82,7 @@ class AnswerQuestion(Tool):
         # Search the open web: DuckDuckGo, Bing, Mojeek, Brave.
         try:
             engines = None if encyclopedic else ["ddg-lite", "bing", "mojeek", "brave"]
-            res = web_search(question, count=8, engines=engines)
+            res = web_search(q, count=8, engines=engines)
             web_results = res.get("results", [])
             engine = res.get("engine", "?")
             fallbacks = res.get("fallbacks", [])
@@ -88,14 +90,16 @@ class AnswerQuestion(Tool):
             raise ToolError(str(exc)) from exc
 
         # Read the top result pages so the answer is checked against real pages.
+        # Snippets come FIRST: search engines curate them and they usually carry
+        # the answer, while scraped page text is long and noisy.
         seen = {s["url"] for s in sources if s["url"]}
+        snippet_sources: list[dict] = []
         read = []
         for r in web_results:
             url = (r.get("url") or "").strip()
             if url and url not in seen and r.get("snippet"):
-                # snippets are evidence too - they often carry the answer
-                sources.append({"title": r.get("title", ""), "url": url,
-                                "text": r["snippet"]})
+                snippet_sources.append({"title": r.get("title", ""), "url": url,
+                                        "text": r["snippet"]})
             if len(read) >= max(1, int(read_pages)):
                 continue
             if not url or url in seen:
@@ -105,10 +109,12 @@ class AnswerQuestion(Tool):
             except BrowseError:
                 continue
             body = page["text"][:4000]
-            sources.append({"title": page.get("title", r.get("title", "")),
-                            "url": url, "text": body})
+            snippet_sources.append({"title": page.get("title", r.get("title", "")),
+                                    "url": url, "text": body})
             read.append({"title": page.get("title", ""), "url": url})
             seen.add(url)
+
+        sources = snippet_sources + sources
 
         if not sources:
             raise ToolError("no sources found for that question")
@@ -117,10 +123,9 @@ class AnswerQuestion(Tool):
         v = verify_claim(claim, sources)
 
         # ONE line first - that is what the chat shows.
-        one = short_answer(question, sources)
+        one = short_answer(q, sources)
         if not one:
-            one = ans.get("title", "") if ans else (
-                web_results[0]["title"] if web_results else "(no answer found)")
+            one = "(no clear answer found - try 'what is ...')"
 
         out = [one, "---"]
         if ans:

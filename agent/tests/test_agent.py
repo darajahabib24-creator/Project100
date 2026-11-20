@@ -989,6 +989,44 @@ def test_opinion_questions_are_not_encyclopedic():
         assert is_encyclopedic(q) is False, q
 
 
+def test_normalize_query_inserts_of():
+    from agent.search import normalize_query
+    assert normalize_query("capital france") == "capital of france"
+    assert normalize_query("population of Tokyo") == "population of Tokyo"
+    assert normalize_query("python") == "python"
+
+
+def test_short_answer_gives_the_value():
+    from agent.search import short_answer
+    src = [{"title": "Paris", "url": "x",
+            "text": "Paris is the capital of France. It has been for centuries."}]
+    assert short_answer("what is the capital of France", src) == "Paris"
+    assert short_answer("capital france", src) == "Paris"
+    src2 = [{"title": "Hamlet", "url": "z",
+             "text": "Hamlet is a tragedy written by William Shakespeare."}]
+    assert short_answer("who wrote Hamlet", src2) == "William Shakespeare"
+
+
+def test_short_answer_never_returns_a_page_title():
+    """Regression: a title like 'Listen to Capital live' is not an answer."""
+    from agent.search import short_answer
+    src = [{"title": "Listen to Capital live", "url": "r",
+            "text": "Listen to Capital live. Tune in for the best music."}]
+    assert short_answer("capital", src) == ""
+    # a question is not an answer either
+    src2 = [{"title": "What is the Capital of France?", "url": "w",
+             "text": "What is the Capital of France?"}]
+    assert short_answer("what is the capital of France", src2) == ""
+
+
+def test_short_answer_uses_number_with_units():
+    from agent.search import short_answer
+    src = [{"title": "S", "url": "y",
+            "text": "The speed of light in vacuum is a universal physical "
+                    "constant denoted c, exactly equal to 299792458 m/s."}]
+    assert short_answer("what is the speed of light", src) == "299792458 m/s"
+
+
 def test_answer_question_uses_whole_web(tmp_path, monkeypatch):
     """answer_question must search the web AND read pages, not just Wikipedia."""
     from agent import search, browse

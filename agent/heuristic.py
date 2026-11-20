@@ -13,6 +13,7 @@ import re
 from typing import Any
 
 from .core import Model, render
+from .search import normalize_query
 
 # Goal phrases that name a file to create. The filename must look like a path
 # token (contain a dot) so the literal words "file"/"script" are not captured.
@@ -136,6 +137,10 @@ class RulePolicy(Model):
             url = um.group(1)
         return json.dumps([{"title": title, "url": url, "text": body[:2500]}])
 
+    def reset_turn(self) -> None:
+        """Chat calls this before each question so per-turn state starts clean."""
+        self.calls_made = 0
+
     @staticmethod
     def _turn(prompt: str) -> str:
         """Only the CURRENT question's part of the transcript.
@@ -226,6 +231,9 @@ class RulePolicy(Model):
         question_m = QUESTION_RE.search(goal)
         fix_m = FIX_RE.search(goal)
         verify_m = VERIFY_RE.search(goal)
+        # "capital france" is a question even without "what is"
+        if not question_m and normalize_query(goal) != goal.strip():
+            question_m = True
 
         if self.calls_made >= self.max_calls:
             return "I have gathered enough; the task is complete."
@@ -238,6 +246,15 @@ class RulePolicy(Model):
         # A fix request: reproduce, search the web for the error, then edit.
         if fix_m:
             return self._fix_turn(goal, prompt)
+
+        # Not a command, not a file task, not a fact to remember, not a fix:
+        # treat it as something to look up on the web. This is what makes a
+        # bare word like "python" answerable.
+        if not (create_m or read_m or remember_m or verify_m):
+            if "[tool:answer_question]" not in turn:
+                return ("I will look that up.\n"
+                        + _call("answer_question", question=goal, read_page=True))
+            return "I have the answer; the task is complete."
 
         # A question: answer it from a cited source first, and if the answer is
         # not encyclopedic, search the web.
