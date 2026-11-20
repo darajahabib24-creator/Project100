@@ -20,6 +20,7 @@ import sys
 import time
 
 try:  # normal case: imported as part of the package
+    from . import httpdebug
     from .core import Agent, Memory, ToolBus
     from .models import make_model
     from .policy import ScriptedModel
@@ -27,6 +28,7 @@ try:  # normal case: imported as part of the package
     from .ui import Spinner
 except ImportError:  # run as a plain script: python3 agent/cli.py
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from agent import httpdebug
     from agent.core import Agent, Memory, ToolBus
     from agent.models import make_model
     from agent.policy import ScriptedModel
@@ -55,6 +57,8 @@ def make_parser():
     p.add_argument("--once", action="store_true",
                    help="answer one goal and exit (no chat loop)")
     p.add_argument("--dump", help="write the finished transcript to this JSON")
+    p.add_argument("--http-debug", action="store_true",
+                   help="print every outbound HTTP request/response to stderr")
     return p
 
 
@@ -175,6 +179,8 @@ def run_interactive(agent, spinner, first_goal, quiet=False, show_log=False):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.http_debug:
+        httpdebug.set_enabled(True)
     try:
         model = _select_model(args)
     except RuntimeError as exc:

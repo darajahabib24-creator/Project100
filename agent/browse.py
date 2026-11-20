@@ -12,6 +12,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import httpdebug
+
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -33,10 +35,18 @@ def fetch(url: str, timeout: int = 20) -> tuple[str, str]:
     req = urllib.request.Request(url, headers={
         "User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read(MAX_BYTES)
-        charset = resp.headers.get_content_charset() or "utf-8"
-        final = resp.geturl()
+    started = httpdebug.request("GET", url)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(MAX_BYTES)
+            status = resp.status
+            charset = resp.headers.get_content_charset() or "utf-8"
+            final = resp.geturl()
+    except Exception as exc:
+        httpdebug.response(url, None, 0, started,
+                           err=f"{type(exc).__name__}: {exc}")
+        raise
+    httpdebug.response(final, status, len(raw), started)
     return final, raw.decode(charset, errors="replace")
 
 

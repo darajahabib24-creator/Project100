@@ -2,22 +2,26 @@
 
 No API key, no vendor SDK. `web_search` tries, in order:
   1. DuckDuckGo lite   - GET form, no JS, no key
-  2. Brave HTML         - no key, different index
-  3. Wikipedia API      - only for encyclopedic queries (see is_encyclopedic)
-and returns normalised results. A failed engine falls through, so one blocked
-host does not kill the search.
+  2. Bing RSS          - clean URLs, no key
+  3. Mojeek HTML       - independent index, no key
+  4. Brave HTML        - no key, different index
+  5. Google HTML       - last resort; rate-limits bots (see google)
+A failed engine falls through, so one blocked host does not kill the search.
+Wikipedia is used by direct_answer for definitional queries.
 """
 
 from __future__ import annotations
 
 import html as html_mod
 import json
+import os
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import httpdebug
 from .verify import STOP, tokens
 
 USER_AGENT = (
@@ -42,9 +46,17 @@ def _get(url: str, timeout: int = TIMEOUT, headers: dict | None = None) -> str:
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read(2_000_000)
-        charset = resp.headers.get_content_charset() or "utf-8"
+    started = httpdebug.request("GET", url)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(2_000_000)
+            status = resp.status
+            charset = resp.headers.get_content_charset() or "utf-8"
+    except Exception as exc:
+        httpdebug.response(url, None, 0, started,
+                           err=f"{type(exc).__name__}: {exc}")
+        raise
+    httpdebug.response(url, status, len(raw), started)
     return raw.decode(charset, errors="replace")
 
 
@@ -165,6 +177,78 @@ def brave_html(query: str, count: int = 10) -> list[dict]:
             break
     if not results:
         raise SearchError("brave: no results parsed")
+    return results
+
+
+def google(query: str, count: int = 10) -> list[dict]:
+    """Google web search HTML. No key, but Google aggressively rate-limits
+    bots and serves consent/JS interstitials, so this is a last-resort engine:
+    it raises SearchError when the SERP cannot be parsed and web_search moves
+    on to the next engine."""
+    url = "https://www.google.com/search?" + urllib.parse.urlencode(
+        {"q": query, "num": count, "hl": "en", "gbv": "1"})
+    body = _get(url, headers={"Accept": "text/html,application/xhtml+xml"})
+    if len(body) < MIN_BODY:
+        raise SearchError("google: suspiciously short body")
+    if "<h3" not in body.lower():
+        raise SearchError("google: no results parsed (blocked or changed)")
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(href: str, title: str) -> None:
+        if href.startswith("/url?"):
+            qm = re.search(r"[?&]q=([^&]+)", href)
+            href = urllib.parse.unquote(qm.group(1)) if qm else ""
+        href = html_mod.unescape(href)
+        if not _valid(href) or "google." in href or "gstatic." in href:
+            return
+        if href in seen:
+            return
+        title = _strip_tags(title)
+        if len(title) < 4:
+            return
+        seen.add(href)
+        results.append(_result(href, title, "", "google"))
+
+    # pattern A: <a href="URL"><h3>TITLE</h3></a>
+    for m in re.finditer(r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', body, re.S):
+        tm = re.search(r"<h3[^>]*>(.*?)</h3>", m.group(2), re.S)
+        if tm:
+            _add(m.group(1), tm.group(1))
+    # pattern B: <h3><a href="URL">TITLE</a></h3>
+    for m in re.finditer(
+            r"<h3[^>]*>\s*<a\b[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>", body, re.S):
+        _add(m.group(1), m.group(2))
+    results = results[:count]
+    if not results:
+        raise SearchError("google: no results parsed")
+    return results
+
+
+def searxng(query: str, count: int = 10) -> list[dict]:
+    """SearXNG metasearch, JSON output. Aggregates many engines under one URL.
+
+    No key, but it is opt-in (not in the default chain) because a public
+    instance rate-limits shared IPs. Point AGENT_SEARXNG_URL at your own
+    instance for reliability and privacy."""
+    base = os.environ.get("AGENT_SEARXNG_URL", "https://searxng.website/searxng")
+    url = base.rstrip("/") + "/search?" + urllib.parse.urlencode(
+        {"q": query, "format": "json", "safesearch": "0",
+         "category_general": "1"})
+    body = _get(url, headers={"Accept": "application/json"})
+    try:
+        obj = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise SearchError(f"searxng: bad JSON (disabled or blocked): {exc}") from exc
+    results: list[dict] = []
+    for r in (obj.get("results") or [])[:count]:
+        u = r.get("url") or ""
+        if not _valid(u):
+            continue
+        results.append(_result(u, r.get("title", ""), r.get("content", ""),
+                               "searxng", source=r.get("engine", "")))
+    if not results:
+        raise SearchError("searxng: no results")
     return results
 
 
@@ -335,15 +419,40 @@ ATTRS = ("capital", "capital city", "population", "president", "prime minister",
 
 
 def normalize_query(q: str) -> str:
-    """Turn a bare query into a question: 'capital france' -> 'capital of France'.
+    """Turn a bare/typo'd query into a question.
 
     Users type fragments in a chat. Without this the extractor cannot match a
     'capital of X is Y' pattern and the answer comes back empty or wrong.
+
+      capital france           -> capital of France
+      what capital of germany  -> what is the capital of germany
+      what capital germany     -> what is the capital of germany
     """
-    words = q.strip().split()
-    if len(words) < 2 or " of " in q:
+    q = q.strip()
+    low = q.lower()
+    words = low.split()
+    if len(words) < 2:
         return q
-    if words[0].lower() in ATTRS:
+
+    # A leading 'what' with no verb: 'what capital of germany'. Rebuild it as
+    # a full question so short_answer's 'what is the <attr> of <subj>' matches.
+    # Work from the original text and use `low` only for matching, so the
+    # subject keeps its capitalisation ('population of Japan').
+    if low.startswith("what") and not re.match(r"^what(?:'s| is| are)(?:\s|$)", low):
+        rest = q[len("what"):].strip()
+        rest_low = rest.lower()
+        parts = rest.split()
+        if " of " in rest_low or (parts and parts[0].lower() in ATTRS):
+            rest = re.sub(r"(?i)^the\s+", "", rest)
+            parts = rest.split()
+            rest_low = rest.lower()
+            if " of " not in rest_low and parts and parts[0].lower() in ATTRS:
+                rest = parts[0] + " of " + " ".join(parts[1:])
+            return "what is the " + rest
+
+    if " of " in low:
+        return q
+    if words[0] in ATTRS:
         return " ".join([words[0], "of"] + words[1:])
     return q
 
@@ -477,7 +586,8 @@ def short_answer(question: str, sources: list[dict], limit: int = 120) -> str:
 
 
 ENGINES = {"ddg-lite": "ddg_lite", "brave": "brave_html", "bing": "bing",
-           "mojeek": "mojeek", "wikipedia": "wikipedia"}
+           "mojeek": "mojeek", "google": "google", "searxng": "searxng",
+           "wikipedia": "wikipedia"}
 
 
 def _engine(name: str):
@@ -496,9 +606,10 @@ def web_search(query: str, count: int = 10, engines: list[str] | None = None,
     if not query:
         raise SearchError("empty query")
 
-    order = engines or ["ddg-lite", "bing", "mojeek", "brave"]
+    # google is last: it rate-limits bots, so only use it when others fail.
+    order = engines or ["ddg-lite", "bing", "mojeek", "brave", "google"]
     if is_encyclopedic(query):
-        order = ["bing", "ddg-lite", "mojeek", "brave"]
+        order = ["bing", "ddg-lite", "mojeek", "brave", "google"]
 
     fallbacks, last_err = [], None
     retried: set[str] = set()

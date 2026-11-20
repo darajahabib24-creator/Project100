@@ -594,6 +594,169 @@ def test_search_parses_ddg_results(monkeypatch):
     assert res[0]["engine"] == "ddg-lite"
 
 
+GOOGLE_BODY = """
+<html><body><div id="search">
+<p>Filler text so the body clears the minimum-size guard that rejects
+interstitial pages. This paragraph is deliberately long enough.</p>
+<div class="g"><a href="https://example.com/paris"><h3>Paris - Wikipedia</h3></a>
+<span>Paris is the capital of France.</span></div>
+<div class="g"><a href="/url?q=https%3A%2F%2Fexample.com%2Fguide&amp;sa=U"><h3>Paris guide</h3></a></div>
+<h3><a href="https://example.com/third">Third result</a></h3>
+<a href="https://about.google/">About Google</a>
+</div></body></html>
+"""
+
+
+def test_google_parses_serp(monkeypatch):
+    from agent import search
+
+    monkeypatch.setattr(search, "_get", lambda *a, **k: GOOGLE_BODY)
+    res = search.google("paris", count=5)
+    urls = [r["url"] for r in res]
+    assert urls[0] == "https://example.com/paris"
+    assert "https://example.com/guide" in urls      # /url?q= unwrapped
+    assert "https://example.com/third" in urls      # h3>a pattern
+    assert all("google." not in u for u in urls)
+    assert all(r["engine"] == "google" for r in res)
+
+
+def test_google_rejects_blocked_page(monkeypatch):
+    from agent import search
+
+    monkeypatch.setattr(search, "_get",
+                        lambda *a, **k: "<html><body>consent</body></html>")
+    try:
+        search.google("paris")
+    except search.SearchError:
+        pass
+    else:
+        raise AssertionError("expected SearchError")
+
+
+def test_web_search_routes_to_google(monkeypatch):
+    from agent import search
+
+    monkeypatch.setattr(search, "google",
+                        lambda q, count=10: [{"url": "https://x", "title": "T",
+                                              "snippet": "", "engine": "google"}])
+    out = search.web_search("q", engines=["google"])
+    assert out["engine"] == "google"
+    assert out["results"][0]["url"] == "https://x"
+
+
+def test_searxng_parses_json(monkeypatch):
+    from agent import search
+
+    body = ('{"results":['
+            '{"url":"https://example.com/p","title":"Python",'
+            '"content":"A programming language.","engine":"google"},'
+            '{"url":"bad","title":"x"}'
+            ']}')
+    monkeypatch.setattr(search, "_get", lambda *a, **k: body)
+    res = search.searxng("python", count=5)
+    assert len(res) == 1
+    assert res[0]["url"] == "https://example.com/p"
+    assert res[0]["snippet"] == "A programming language."
+    assert res[0]["engine"] == "searxng"
+
+
+def test_searxng_rejects_non_json(monkeypatch):
+    from agent import search
+
+    monkeypatch.setattr(search, "_get", lambda *a, **k: "<html>rate limited</html>")
+    try:
+        search.searxng("python")
+    except search.SearchError:
+        pass
+    else:
+        raise AssertionError("expected SearchError")
+
+
+def test_httpdebug_off_by_default_is_noop():
+    from agent import httpdebug
+
+    httpdebug.set_enabled(False)
+    assert httpdebug.enabled() is False
+    httpdebug.request("GET", "http://example.com")     # must not raise
+    httpdebug.response("http://example.com", 200, 5, 0.0)
+
+
+def test_httpdebug_logs_get(monkeypatch):
+    from agent import httpdebug, search
+
+    lines = []
+    monkeypatch.setattr(httpdebug, "_emit", lambda s: lines.append(s))
+    httpdebug.set_enabled(True)
+
+    class FakeHeaders:
+        def get_content_charset(self):
+            return "utf-8"
+
+    class FakeResp:
+        status = 200
+        headers = FakeHeaders()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n):
+            return b"hello"
+
+    monkeypatch.setattr(search.urllib.request, "urlopen",
+                        lambda *a, **k: FakeResp())
+    out = search._get("http://example.com")
+    assert out == "hello"
+    assert any("--> GET http://example.com" in s for s in lines)
+    assert any("<-- http://example.com 200 5B" in s for s in lines)
+    httpdebug.set_enabled(False)
+
+
+def test_httpdebug_logs_browse_fetch(monkeypatch):
+    from agent import browse, httpdebug
+
+    lines = []
+    monkeypatch.setattr(httpdebug, "_emit", lambda s: lines.append(s))
+    httpdebug.set_enabled(True)
+
+    class FakeHeaders:
+        def get_content_charset(self):
+            return "utf-8"
+
+    class FakeResp:
+        status = 200
+        headers = FakeHeaders()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n):
+            return b"<html>page</html>"
+
+        def geturl(self):
+            return "http://example.com/p"
+
+    monkeypatch.setattr(browse.urllib.request, "urlopen",
+                        lambda *a, **k: FakeResp())
+    final, html = browse.fetch("http://example.com/p")
+    assert final == "http://example.com/p"
+    assert any("--> GET http://example.com/p" in s for s in lines)
+    assert any("<-- http://example.com/p 200" in s for s in lines)
+    httpdebug.set_enabled(False)
+
+
+def test_cli_http_debug_flag():
+    from agent.cli import parse_args
+
+    args = parse_args(["--once", "x", "--http-debug"])
+    assert args.http_debug is True
+
+
 def test_search_falls_through_on_failure(monkeypatch):
     from agent import search
 
@@ -994,6 +1157,25 @@ def test_normalize_query_inserts_of():
     assert normalize_query("capital france") == "capital of france"
     assert normalize_query("population of Tokyo") == "population of Tokyo"
     assert normalize_query("python") == "python"
+
+
+def test_normalize_query_repairs_what_without_verb():
+    """Regression: 'what capital of germany' (no is/the) returned no answer."""
+    from agent.search import normalize_query
+    assert normalize_query("what capital of germany") == "what is the capital of germany"
+    assert normalize_query("what capital germany") == "what is the capital of germany"
+    assert normalize_query("what population of Japan") == "what is the population of Japan"
+    # already-correct forms are left untouched
+    assert normalize_query("what is the capital of germany") == "what is the capital of germany"
+    assert normalize_query("what's the capital of germany") == "what's the capital of germany"
+
+
+def test_short_answer_what_without_verb():
+    from agent.search import short_answer
+    src = [{"title": "Berlin", "url": "x",
+            "text": "Berlin is the capital of Germany. It is the largest city."}]
+    assert short_answer("what capital of germany", src) == "Berlin"
+    assert short_answer("what capital germany", src) == "Berlin"
 
 
 def test_short_answer_gives_the_value():
