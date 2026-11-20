@@ -388,6 +388,25 @@ def short_answer(question: str, sources: list[dict], limit: int = 120) -> str:
 
     qtoks = set(tokens(question)) - STOP
 
+    # High-precision pass first: prefer an explicit "the <attr> of <subj> is
+    # <answer>" sentence ANYWHERE in the sources before trying looser patterns.
+    # Otherwise a noisy snippet in an early source ("Capital city in
+    # Île-de-France, France Paris[b] is the capital...") matches the looser
+    # "<X> is the capital" rule below and bleeds the country into the answer,
+    # even though a later source states it cleanly.
+    if attr and subj:
+        exact = re.compile(re.escape(attr) + r"\s+of\s+" +
+                           re.escape(subj) + r"\s+is\s+(.+)")
+        for s in sources:
+            for sent in sentences(s.get("text", "")):
+                if sent.endswith("?"):
+                    continue
+                mm = exact.search(sent.lower())
+                if mm:
+                    got = clean(sent[mm.start(1):])
+                    if got:
+                        return got
+
     for s in sources:
         for sent in sentences(s.get("text", "")):
             if sent.endswith("?"):
@@ -409,7 +428,15 @@ def short_answer(question: str, sources: list[dict], limit: int = 120) -> str:
                                r"(?:\s+of\s+" + re.escape(subj) + r")?",
                                low)
                 if mm:
-                    got = clean(re.sub(r"\[[^\]]*\]", "", sent[mm.start(1):mm.end(1)]))
+                    piece = re.sub(r"\[[^\]]*\]", "", sent[mm.start(1):mm.end(1)])
+                    # A noisy snippet can place the country before the subject
+                    # ("...France Paris[b] is the capital..."); drop a leading
+                    # whole-word occurrence of the subject so it is not bleeded
+                    # into the answer ("France Paris" -> "Paris").
+                    if subj:
+                        piece = re.sub(r"^(?:\b" + re.escape(subj) + r"\b[\s,]*)+",
+                                       "", piece, flags=re.I).strip()
+                    got = clean(piece)
                     if got:
                         return got
                 # 3. "France is the capital ..." style
