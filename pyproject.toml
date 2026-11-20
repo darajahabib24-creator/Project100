@@ -11,5 +11,8 @@ requires-python = ">=3.10"
 [project.scripts]
 agent = "agent.cli:main"
 
+[project.optional-dependencies]
+rdp-vnc = ["Pillow>=9", "cryptography>=41"]
+
 [tool.setuptools]
 packages = ["agent"]
