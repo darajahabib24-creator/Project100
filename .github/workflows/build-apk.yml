@@ -1,15 +1,16 @@
 name: Interactive Ubuntu Console
 
 on:
-  workflow_dispatch: # Allows you to manually trigger this from the GitHub Actions tab
+  workflow_dispatch:
 
-# Grants your SSH session permission to push changes back to the repository
 permissions:
   contents: write
-    
+  actions: write # Required to trigger the next workflow run via API
+
 jobs:
   interactive-session:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Code
@@ -27,16 +28,44 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libffi-dev python3-dev cargo rustc
-          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-          hermes setup
-          # Automatically restore saved Hermes configs if they exist in the repo
+          curl -fsSL https://nousresearch.com | bash -s -- --skip-setup
+          # Restore saved Hermes configs from previous session
           if [ -d "./hermes-backup" ]; then
             mkdir -p ~/.hermes
             cp -r ./hermes-backup/* ~/.hermes/
           fi
 
+      - name: Start Auto-Backup & Handoff Timer (5h 45m)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat << 'EOF' > /tmp/handoff.sh
+          #!/usr/bin/env bash
+          # Sleep for 345 minutes (5h 45m), leaving 15 mins before GitHub kills the job
+          sleep 20700
+
+          echo "Time limit approaching. Backing up Hermes state..."
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@://github.com"
+          
+          mkdir -p ./hermes-backup
+          cp -r ~/.hermes/* ./hermes-backup/ 2>/dev/null || true
+          
+          git add hermes-backup
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto-backup Hermes state before 6h handoff"
+            git push
+          fi
+
+          # Trigger the next workflow run
+          gh workflow run "Interactive Ubuntu Console" --ref "${{ github.ref_name }}"
+          EOF
+          chmod +x /tmp/handoff.sh
+          nohup /tmp/handoff.sh > /tmp/handoff.log 2>&1 &
+
       - name: Launch Interactive SSH Terminal
         uses: owenthereal/action-upterm@v2
         with:
           limit-access-to-actor: false
+          wait-timeout-minutes: 30
           
