@@ -24,6 +24,7 @@ import argparse
 import csv
 import ipaddress
 import json
+import os
 import re
 import socket
 import ssl
@@ -620,8 +621,207 @@ def _virtual_channel_data(user_id: int, channel_id: int, payload: bytes,
     return _data_tpdu(mcs)
 
 
+# --------------------------------------------------------------------------- #
+# RDP session establishment (client info / license / confirm active)
+# --------------------------------------------------------------------------- #
+#
+# The MS_T120 check only fires on a listener that has completed the RDP
+# connection sequence, so the probe plays the client side of that sequence
+# first: Client Info PDU (2.2.1.11), the license exchange (MS-RDPELE 2.2.2),
+# Confirm Active (2.2.1.13) and the remaining PDUs through 2.2.1.18. The
+# channel joins above are not enough on their own.
+
+SEC_INFO_PKT = 0x40
+SEC_LICENSE_PKT = 0x80
+
+_LICENSE_TAG_REQUEST = 0x01
+_LICENSE_TAG_ERROR_ALERT = 0xFF
+_LICENSE_ERR_LICENSE_ISSUED = 0x07
+
+# Confirm Active PDU data: shareId, originator, 'MSTSC' descriptor and the
+# 14 capability sets a normal client advertises (general, bitmap, order,
+# pointer, color table, window activation, control, share, brush, sound,
+# input, font, glyph cache).
+_CONFIRM_ACTIVE = bytes.fromhex(
+    "ea030100ea0306008e014d53545343000e000000010018000100030000020000"
+    "00000d04000000000000000002001c0010000100010001002003580200000100"
+    "0100000001000000030058000000000000000000000000000000000000000000"
+    "010014000000010047012a000101010100000000010101010001010000000000"
+    "010101000001010100000000a1060000000000000084030000000000e4040000"
+    "1300280000000003780000007800000050010000000000000000000000000000"
+    "000000000000000008000a000100140014000a0008000600000007000c000000"
+    "00000000000005000c00000000000200020009000800000000000f0008000100"
+    "00000d005800010000000904000004000000000000000c000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "00000000000000000000000000000000000000000000000000000c0008000100"
+    "00000e0008000100000010003400fe000400fe000400fe000800fe000800fe00"
+    "1000fe002000fe004000fe008000fe000001400000080001000102000000"
+)
+
+
+def _share_data_header(pdu_type: int, data: bytes) -> bytes:
+    """MS-RDPBCGR 2.2.8.1.1.1.2 Share Data Header."""
+    return (b"\xea\x03\x01\x00" + b"\x00\x01"
+            + (len(data) + 4).to_bytes(2, "little")
+            + bytes([pdu_type]) + b"\x00\x00\x00" + data)
+
+
+def _share_control_header(pdu_type: int, data: bytes) -> bytes:
+    """MS-RDPBCGR 2.2.8.1.1.1.1 Share Control Header."""
+    return ((len(data) + 6).to_bytes(2, "little")
+            + pdu_type.to_bytes(2, "little") + b"\xf1\x03" + data)
+
+
+def _data_request(user_id: int, channel_id: int, data: bytes,
+                  flags: int = 0, security: bool = False) -> bytes:
+    """MCS Send Data Request carrying a standard RDP PDU."""
+    pdu = b""
+    if security:
+        pdu += flags.to_bytes(2, "little") + b"\x00\x00"
+    pdu += data
+    mcs = (b"\x64" + user_id.to_bytes(2, "big")
+           + channel_id.to_bytes(2, "big") + b"\x70"
+           + (len(pdu) | 0x8000).to_bytes(2, "big") + pdu)
+    return _data_tpdu(mcs)
+
+
+def _client_info_pdu(user: str = "rdpscan", domain: str = "",
+                     ip_address: str = "192.168.0.100") -> bytes:
+    """MS-RDPBCGR 2.2.1.11.1 TS_INFO_PACKET + TS_EXTENDED_INFO_PACKET."""
+    user_u = user[:20].encode("utf-16le")
+    domain_u = domain[:24].encode("utf-16le")
+    ip_u = ip_address.encode("utf-16le") + b"\x00\x00"
+    client_dir = "C:\\WINNT\\System32\\mstscax.dll".encode("utf-16le") + b"\x00\x00"
+    standard_name = "GTB, normaltid".encode("utf-16le").ljust(64, b"\x00")
+    daylight_name = "GTB, sommartid".encode("utf-16le").ljust(64, b"\x00")
+    return b"".join([
+        b"\x00\x00\x00\x00",                      # CodePage
+        b"\x33\x01\x00\x00",                      # INFO_* flags
+        len(domain_u).to_bytes(2, "little"),
+        len(user_u).to_bytes(2, "little"),
+        b"\x00\x00", b"\x00\x00", b"\x00\x00",    # password/alt shell/working dir
+        domain_u, b"\x00\x00",
+        user_u, b"\x00\x00",
+        b"\x00\x00", b"\x00\x00", b"\x00\x00",
+        b"\x02\x00", len(ip_u).to_bytes(2, "little"), ip_u,
+        len(client_dir).to_bytes(2, "little"), client_dir,
+        b"\xa4\x01\x00\x00",                      # timezone Bias
+        standard_name,
+        b"\x00\x00\x0a\x00\x00\x00\x05\x00\x03\x00\x00\x00\x00\x00\x00\x00",
+        b"\x00\x00\x00\x00",                      # StandardBias
+        daylight_name,
+        b"\x00\x00\x03\x00\x00\x00\x05\x00\x02\x00\x00\x00\x00\x00\x00\x00",
+        b"\xc4\xff\xff\xff",                      # DaylightBias
+        b"\x00\x00\x00\x00",                      # clientSessionId
+        b"\x27\x00\x00\x00",                      # performanceFlags
+        b"\x00\x00",                              # cbAutoReconnectCookie
+    ])
+
+
+def _new_license_request_pdu(user: str = "rdpscan",
+                             host: str = "rdpscan") -> bytes:
+    """MS-RDPELE 2.2.2.2 Client New License Request."""
+    client_random = os.urandom(32)
+    user_b = user.encode("ascii", "replace")
+    host_b = host.encode("ascii", "replace")
+    body = b"".join([
+        b"\x13", b"\x03", b"\x00\x00",            # tag, version, length
+        b"\x01\x01\x00\x00\x00\x01\xff",          # KEY_EXCHANGE_ALG_RSA
+        client_random,
+        b"\x02\x00", (64).to_bytes(2, "little"), b"\x00" * 64,
+        b"\x0f\x00", (len(user_b) + 1).to_bytes(2, "little"),
+        user_b + b"\x00",
+        b"\x10\x00", (len(host_b) + 1).to_bytes(2, "little"),
+        host_b + b"\x00",
+    ])
+    return body[:2] + len(body).to_bytes(2, "little") + body[4:]
+
+
+_LICENSE_TAGS = {0x01, 0x02, 0x03, 0x12, 0x13, 0x15, 0xFF}
+
+
+def _parse_license_pdu(pkt: bytes, sock, user_id: int,
+                       user: str = "rdpscan", host: str = "rdpscan") -> bool:
+    """Handle a server license PDU. True when the session may proceed."""
+    if len(pkt) < 15 or pkt[7] != 0x64:
+        return True
+    # MCS user-data length: one byte, or two bytes with the high bit set.
+    payload = pkt[15:] if pkt[13] & 0x80 else pkt[14:]
+    # The license PDU follows an optional 4-byte security header.
+    for off in (0, 4):
+        if len(payload) < off + 4:
+            continue
+        tag = payload[off]
+        if tag not in _LICENSE_TAGS:
+            continue
+        size = int.from_bytes(payload[off + 2:off + 4], "little")
+        if size > len(payload) - off:
+            continue
+        if tag == _LICENSE_TAG_ERROR_ALERT:
+            error_code = int.from_bytes(payload[off + 4:off + 8], "little")
+            return error_code == _LICENSE_ERR_LICENSE_ISSUED
+        if tag == _LICENSE_TAG_REQUEST:
+            sock.sendall(_data_request(user_id, 1003,
+                                       _new_license_request_pdu(user, host),
+                                       flags=SEC_LICENSE_PKT, security=True))
+            return _parse_license_pdu(_recv_tpkt(sock), sock, user_id, user, host)
+        return True
+    return True
+
+
+def _confirm_active_pdu() -> bytes:
+    return _share_control_header(0x13, _CONFIRM_ACTIVE)
+
+
+def _synchronize_pdu(target_user: int = 1009) -> bytes:
+    pdu = b"\x01\x00" + target_user.to_bytes(2, "little")
+    return _share_control_header(0x17, _share_data_header(0x1F, pdu))
+
+
+def _control_cooperate_pdu() -> bytes:
+    return _share_control_header(0x17, _share_data_header(
+        0x14, bytes.fromhex("0400000000000000")))
+
+
+def _control_request_pdu() -> bytes:
+    return _share_control_header(0x17, _share_data_header(
+        0x14, bytes.fromhex("0100000000000000")))
+
+
+def _input_sync_pdu() -> bytes:
+    return _share_control_header(0x17, _share_data_header(
+        0x1C, bytes.fromhex("01000000000000000000000000000000")))
+
+
+def _font_list_pdu() -> bytes:
+    return _share_control_header(0x17, _share_data_header(
+        0x27, bytes.fromhex("0000000003003200")))
+
+
+def _establish_session(sock, user_id: int) -> bool:
+    """Play the client side of the RDP connection sequence. True on success."""
+    sock.sendall(_data_request(user_id, 1003, _client_info_pdu(),
+                               flags=SEC_INFO_PKT, security=True))
+    license_pdu = _recv_tpkt(sock)
+    if not _parse_license_pdu(license_pdu, sock, user_id):
+        return False
+    if len(license_pdu) <= 34:
+        _recv_tpkt(sock)                              # Server Demand Active
+    sock.sendall(_data_request(user_id, 1003, _confirm_active_pdu()))
+    sock.sendall(_data_request(user_id, 1003, _synchronize_pdu()))
+    sock.sendall(_data_request(user_id, 1003, _control_cooperate_pdu()))
+    sock.sendall(_data_request(user_id, 1003, _control_request_pdu()))
+    sock.sendall(_data_request(user_id, 1003, _input_sync_pdu()))
+    sock.sendall(_data_request(user_id, 1003, _font_list_pdu()))
+    return True
+
+
 def _bluekeep_probe(sock: socket.socket, selected: int) -> str:
     """Bind MS_T120 outside its slot and send the crash-safe probe payload.
+
+    The listener has to complete the RDP connection sequence before the
+    MS_T120 channel is bound, so the probe establishes the session first
+    (client info, license, confirm active) and only then sends the payloads.
 
     Returns 'vulnerable' only when the server sends the MCS Disconnect
     Provider Ultimatum; 'safe' when it completes the session and stays quiet;
@@ -640,14 +840,26 @@ def _bluekeep_probe(sock: socket.socket, selected: int) -> str:
             sock.sendall(_data_tpdu(b"\x38" + user_id.to_bytes(2, "big")
                                     + chan.to_bytes(2, "big")))
             _recv_tpkt(sock)                              # Channel Join Confirm
+        if not _establish_session(sock, user_id):
+            return "error"
+        # Drain what the server pushed while the session came up.
+        sock.settimeout(0.5)
+        while True:
+            try:
+                if not sock.recv(65535):
+                    return "error"
+            except socket.timeout:
+                break
         sock.settimeout(1.0)
         for _ in range(6):
             for payload in (_BLUEKEEP_X86, _BLUEKEEP_X64):
                 sock.sendall(_virtual_channel_data(user_id, 1005, payload))
             try:
-                data = _recv_tpkt(sock)
+                data = sock.recv(65535)
             except socket.timeout:
                 continue
+            if not data:
+                return "error"
             if _ULTIMATUM in data:
                 return "vulnerable"
         return "safe"
@@ -866,6 +1078,9 @@ def _selftest() -> int:
     check("MCS connect initial binds MS_T120", b"MS_T120" in init)
     check("classify nla", classify_protocol(PROTOCOL_HYBRID) == "nla")
     check("classify standard", classify_protocol(PROTOCOL_RDP) == "standard")
+    check("confirm active advertises MSTSC", b"MSTSC" in _confirm_active_pdu())
+    check("client info carries the user name",
+          "rdpscan".encode("utf-16le") in _client_info_pdu())
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

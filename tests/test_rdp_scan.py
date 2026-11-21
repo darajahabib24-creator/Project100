@@ -28,6 +28,7 @@ from rdp_scan import (  # noqa: E402
     ScanResult,
     _MCS_CHANNELS,
     _pdu_connect_initial,
+    _parse_license_pdu,
     assess_findings,
     build_connection_request,
     build_parser,
@@ -530,13 +531,73 @@ def _data_tpdu(data):
 _ULTIMATUM = bytes.fromhex("0300000902f0802180")
 
 
+def _mcs_channel(pkt):
+    """Channel id from an MCS Send Data Request, or None."""
+    if len(pkt) < 12 or pkt[7] != 0x64:
+        return None
+    return int.from_bytes(pkt[10:12], "big")
+
+
+def _license_issued_pdu(user_id=1009):
+    """LICENSE_ERROR_ALERT with LICENSE_ISSUED, as a real listener sends."""
+    payload = bytes.fromhex("80020000ff031000070000000200000004000000")
+    mcs = (b"\x64" + user_id.to_bytes(2, "big") + b"\x03\xeb" + b"\x70"
+           + bytes([len(payload)]) + payload)
+    return _data_tpdu(mcs)
+
+
+class _FakeSock:
+    """Minimal socket double: an inbound buffer plus recorded sends."""
+
+    def __init__(self, chunks=()):
+        self.buf = b"".join(chunks)
+        self.sent = []
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def recv(self, n):
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+
+def _license_request_pdu(user_id=1009):
+    payload = b"\x80\x02\x00\x00" + bytes.fromhex("01031000") + b"\x00" * 12
+    mcs = (b"\x64" + user_id.to_bytes(2, "big") + b"\x03\xeb" + b"\x70"
+           + bytes([len(payload)]) + payload)
+    return _data_tpdu(mcs)
+
+
+class TestLicensePdu(unittest.TestCase):
+    def test_issued_alert_proceeds(self):
+        sock = _FakeSock([_license_issued_pdu(1009)])
+        self.assertTrue(_parse_license_pdu(_recv_tpkt(sock), sock, 1009))
+        self.assertEqual(sock.sent, [])
+
+    def test_other_error_alert_stops(self):
+        payload = bytes.fromhex("80020000ff031000060000000200000004000000")
+        mcs = (b"\x64" + (1009).to_bytes(2, "big") + b"\x03\xeb" + b"\x70"
+               + bytes([len(payload)]) + payload)
+        self.assertFalse(_parse_license_pdu(_data_tpdu(mcs), _FakeSock(), 1009))
+
+    def test_request_is_answered_with_new_license_request(self):
+        sock = _FakeSock([_license_issued_pdu(1009)])
+        self.assertTrue(_parse_license_pdu(_license_request_pdu(1009), sock, 1009))
+        self.assertEqual(len(sock.sent), 1)
+        rsp = sock.sent[0]
+        self.assertEqual(_mcs_channel(rsp), 1003)
+        self.assertEqual(rsp[19], 0x13)          # LICENSE_NEW_LICENSE_REQ
+
+
 class FakeBlueKeepServer(FakeRdpServer):
     """TLS RDP server that completes the MCS session and answers the probe."""
 
-    def __init__(self, vulnerable=True):
+    def __init__(self, vulnerable=True, license_request=False):
         super().__init__(mode="tls", tls=True)
         self.vulnerable = vulnerable
+        self.license_request = license_request
         self.saw_ms_t120 = False
+        self.saw_session = False
         self.probe_packets = 0
 
     def _handle(self, conn):
@@ -558,6 +619,17 @@ class FakeBlueKeepServer(FakeRdpServer):
             for _ in range(7):                       # Channel Join Requests
                 _recv_tpkt(tls)
                 tls.sendall(_data_tpdu(b"\x02\x00\x03\xf1\x03\xeb"))
+            info = _recv_tpkt(tls)                   # Client Info PDU
+            if _mcs_channel(info) != 1003:
+                return
+            if self.license_request:                 # Windows asks first
+                tls.sendall(_license_request_pdu())
+                _recv_tpkt(tls)                      # client's New License Req
+            tls.sendall(_license_issued_pdu())       # license exchange
+            tls.sendall(_data_tpdu(b"\x00" * 16))    # Server Demand Active
+            for _ in range(6):                       # Confirm Active .. Font List
+                _recv_tpkt(tls)
+            self.saw_session = True
             if self.vulnerable:
                 pkt = _recv_tpkt(tls)
                 self.probe_packets += 1
@@ -590,6 +662,7 @@ class TestBlueKeepProbe(unittest.TestCase):
             r = probe_host("127.0.0.1", srv.port, timeout=5, bluekeep=True)
             self.assertEqual(r.bluekeep, "vulnerable")
             self.assertTrue(srv.saw_ms_t120)
+            self.assertTrue(srv.saw_session)
             self.assertGreaterEqual(srv.probe_packets, 1)
         finally:
             srv.close()
@@ -600,6 +673,17 @@ class TestBlueKeepProbe(unittest.TestCase):
             r = probe_host("127.0.0.1", srv.port, timeout=5, bluekeep=True)
             self.assertEqual(r.bluekeep, "safe")
             self.assertTrue(srv.saw_ms_t120)
+            self.assertTrue(srv.saw_session)
+        finally:
+            srv.close()
+
+    def test_license_request_path_is_handled(self):
+        srv = FakeBlueKeepServer(vulnerable=True, license_request=True)
+        try:
+            r = probe_host("127.0.0.1", srv.port, timeout=5, bluekeep=True)
+            self.assertEqual(r.bluekeep, "vulnerable")
+            self.assertTrue(srv.saw_session)
+            self.assertGreaterEqual(srv.probe_packets, 1)
         finally:
             srv.close()
 

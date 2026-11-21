@@ -13,8 +13,9 @@ Only scan hosts you own or are authorised to test.
 
 - `rdp_scan.py` — the scanner (stdlib only; `cryptography` is used if present
   to parse certificates, otherwise the cert fields are skipped).
-- `tests/test_rdp_scan.py` — 66 tests: codec/parsing, findings, a fake RDP
-  server for end-to-end negotiation, and a fake BlueKeep server for the probe.
+- `tests/test_rdp_scan.py` — 70 tests: codec/parsing, findings, a fake RDP
+  server for end-to-end negotiation, and a fake BlueKeep server that completes
+  the session (license exchange included) and answers the probe.
 
 ## Requirements
 
@@ -49,9 +50,10 @@ comments). `--ports` accepts a list or range (`3389,3390-3392`).
 - **TLS** — protocol version, cipher, and the certificate (subject, issuer, SAN,
   validity, SHA-256 fingerprint, self-signed / expired / not-yet-valid).
 - **BlueKeep (optional, `--bluekeep`)** — on listeners that do not require NLA
-  and offer TLS, it binds the MS_T120 static virtual channel outside its normal
-  slot and sends a small crash-safe payload. A listener that answers with an MCS
-  Disconnect Provider Ultimatum is reported as `bluekeep-possible`.
+  and offer TLS, it establishes the RDP session (client info, license,
+  confirm active), then binds the MS_T120 static virtual channel outside its
+  normal slot and sends a small crash-safe payload. A listener that answers
+  with an MCS Disconnect Provider Ultimatum is reported as `bluekeep-possible`.
 
 ## Findings and exit code
 
@@ -65,6 +67,10 @@ above that severity exists, so it can gate a script or CI step. Use
 - The probe is **non-intrusive**: it sends the same non-DoS channel payloads as
   the Metasploit `cve_2019_0708_bluekeep` check module; it never sends an
   exploit payload and does not attempt to crash the target.
+- It establishes the RDP session first (Client Info PDU, license exchange,
+  Confirm Active), then binds and probes MS_T120. Binding the channel before
+  the connection sequence completes is not reliable, so the probe does the
+  client side of that sequence like the reference check does.
 - It runs only when the listener does **not** require NLA and offers TLS.
   Listeners that require NLA are reported as not applicable; listeners that
   offer only Standard RDP Security are reported as not run (the probe needs a
