@@ -28,12 +28,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libffi-dev python3-dev cargo rustc
-          curl -fsSL https://nousresearch.com | bash -s -- --skip-setup
+          curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup
           # Restore saved Hermes configs from previous session
           if [ -d "./hermes-backup" ]; then
             mkdir -p ~/.hermes
             cp -r ./hermes-backup/* ~/.hermes/
           fi
+          
 
       - name: Start Auto-Backup & Handoff Timer (5h 45m)
         env:
