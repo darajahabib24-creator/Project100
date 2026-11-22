@@ -78,6 +78,19 @@ class TestTextHelpers(unittest.TestCase):
         self.assertTrue(any("import os" in block for block in blocks))
         self.assertFalse(any(block.strip() == "short" for block in blocks))
 
+    def test_extract_raw_links(self):
+        raw = ('<a href="/o/r/blob/main/a.py">a</a>'
+               '<a href="/o/r/blob/main/sub/b.py">b</a>'
+               '<a href="/o/r/blob/main/a.py">a</a>')
+        self.assertEqual(
+            ag.extract_raw_links(raw, "https://github.com/o/r"),
+            ["https://raw.githubusercontent.com/o/r/main/a.py",
+             "https://raw.githubusercontent.com/o/r/main/sub/b.py"])
+
+    def test_extract_raw_links_non_github(self):
+        self.assertEqual(
+            ag.extract_raw_links('<a href="/x">', "https://example.com"), [])
+
     def test_strip_verbs(self):
         self.assertEqual(ag.strip_verbs("please search for cats"), "cats")
         self.assertEqual(ag.strip_verbs("can you find a repo"), "find a repo")
@@ -307,6 +320,24 @@ class TestRuleBasedPlanner(unittest.TestCase):
         self.assertEqual(plan.mode, "clarify")
         self.assertTrue(plan.question)
 
+    def test_create_code_goal(self):
+        plan = self.plan("create me a python object that parses json")
+        self.assertEqual(plan.mode, "pipeline")
+        self.assertEqual(plan.pipeline, "find_code")
+        self.assertEqual(plan.steps[0].tool, "web_search")
+        self.assertIn("python object that parses json",
+                      plan.steps[0].args["query"])
+
+    def test_write_code_without_path(self):
+        plan = self.plan("write me a bash script that backs up files")
+        self.assertEqual(plan.mode, "pipeline")
+        self.assertEqual(plan.pipeline, "find_code")
+
+    def test_find_script_goal(self):
+        plan = self.plan("find me a python script that scrapes a website")
+        self.assertEqual(plan.mode, "pipeline")
+        self.assertEqual(plan.pipeline, "find_code")
+
     def test_fallback_is_search(self):
         plan = self.plan("tell me something interesting")
         self.assertEqual(plan.mode, "pipeline")
@@ -416,6 +447,21 @@ class TestAgentLoop(unittest.TestCase):
         self.assertTrue(content.startswith("#!/usr/bin/env bash"))
         self.assertIn("https://a.example/", content)
 
+    def test_find_code_prints_only_code(self):
+        code = ("def scrape(url):\n"
+                "    import requests\n"
+                "    return requests.get(url).text\n")
+        html = ("<html><head><title>T</title></head><body>"
+                f"<pre>{code}</pre></body></html>")
+        with mock.patch.object(sa, "search_web",
+                               return_value=web_response(["https://a.example/"])), \
+             mock.patch.object(sa, "fetch", return_value=html), \
+             mock.patch.object(sa, "search_scripts",
+                               return_value=sa.SearchResponse([], {})):
+            answer = self.agent.run("create me a python object that parses json")
+        self.assertEqual(answer, code.strip("\n"))
+        self.assertNotIn("http", answer)
+
     def test_script_mode_hides_urls(self):
         out = os.path.join(self.tmp, "search.sh")
         agent = ag.Agent(self.registry, ag.RuleBasedPlanner(),
@@ -484,6 +530,22 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.getvalue().strip(), f"Created script: {path}")
         self.assertTrue(os.path.isfile(path))
+
+    def test_code_flag_prints_only_code(self):
+        code = ("class Parser:\n"
+                "    def parse(self, text):\n"
+                "        return text.split()\n")
+        html = f"<html><body><pre>{code}</pre></body></html>"
+        with mock.patch.object(sa, "search_web",
+                               return_value=web_response(["https://a.example/"])), \
+             mock.patch.object(sa, "fetch", return_value=html), \
+             mock.patch.object(sa, "search_scripts",
+                               return_value=sa.SearchResponse([], {})), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = ag.main(["a python class that splits text", "--code",
+                          "--no-trace"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue().strip(), code.strip("\n"))
 
     def test_one_shot_repl_exit(self):
         with contextlib.redirect_stdout(io.StringIO()), \

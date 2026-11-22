@@ -66,7 +66,7 @@ session they are refused unless `--yes` is passed.
 
 Options: `--model {rules,ollama}` (default `rules`), `--memory PATH`,
 `--max-steps N`, `--yes`, `--trace/--no-trace`, `--json`, `--tools`,
-`--script PATH`.
+`--script PATH`, `--code`.
 
 `--script PATH` writes the search results to a runnable bash script and the
 answer is only that path -- no URL list is printed. The same is true when the
@@ -80,13 +80,33 @@ few results and prints each page's text or extracted code blocks, so you get
 the actual content rather than a bare list of links. Add `--script PATH` if
 you want the results written to a script instead.
 
+### Finding a whole script
+
+Goals that ask for code -- "create me a python script that downloads a
+webpage", "write me a bash script that finds files larger than 1MB", "find me
+a python script that scrapes a website" -- run the `find_code` pipeline. The
+agent searches the web (and GitHub), fetches the best matching page, and for
+GitHub repos follows the file links to fetch the raw source file. It prints
+only the script itself: no title, no URL, no commentary. `--code` forces this
+mode for any description.
+
+```
+python3 agent.py "create me a python script that downloads a webpage"
+python3 agent.py "write me a bash script that finds files larger than 1MB" --code
+```
+
+Note: results depend on the public search engines. From some networks Bing,
+DuckDuckGo and Google return challenge pages or unrelated results, so a query
+may come back empty or with whatever code the fetched pages happen to contain.
+
 ### Brains
 
 - `rules` (default): no model at all. Intent matching plus multi-step
-  pipelines: `search_content` (search, fetch the top results, print their
-  text or code blocks -- not just links), `research` (search, fetch, extract
-  an answer with a citation), `fetch_extract`, `save_results`,
-  `make_search_script`.
+  pipelines: `find_code` (search the web, fetch the best matching page or
+  GitHub source file, print only the whole script -- no links), `search_content`
+  (search, fetch the top results, print their text or code blocks),
+  `research` (search, fetch, extract an answer with a citation),
+  `fetch_extract`, `save_results`, `make_search_script`.
 - `ollama`: uses a free local model through `http://127.0.0.1:11434` (set
   `OLLAMA_BASE` / `--ollama-base` and `OLLAMA_MODEL` / `--ollama-model`).
   Still no API key and nothing leaves the machine. The script exits with a

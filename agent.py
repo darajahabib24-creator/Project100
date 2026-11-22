@@ -54,11 +54,27 @@ STOPWORDS = {
     "where", "which", "who", "why", "will", "with", "would", "you", "your",
 }
 
+# Words that say "this is code" but not which code; useless for relevance.
+_CODE_STOPWORDS = {
+    "python", "python3", "bash", "sh", "shell", "javascript", "js", "java",
+    "cpp", "c++", "ruby", "php", "typescript", "ts", "kotlin", "swift",
+    "perl", "lua", "scala", "dart", "rust", "golang", "html", "css", "sql",
+    "script", "scripts", "code", "program", "example", "snippet", "file",
+    "files", "language", "source", "function", "class", "object", "module",
+}
+
+# Subset worth dropping from a web query too (keep task words like "file").
+_QUERY_FILLER = _CODE_STOPWORDS - {
+    "file", "files", "function", "class", "object", "module",
+}
+
 VERB_PREFIXES = (
     "i want you to", "i need you to", "i'd like you to", "could you",
     "would you", "can you", "please", "help me",
     "search for", "search", "look up", "lookup", "find me", "get me",
-    "show me", "google", "bing", "browse", "research",
+    "give me", "show me", "google", "bing", "browse", "research",
+    "create", "write", "make", "generate", "build", "need",
+    "me a", "me an",
 )
 
 _VERB_RE = re.compile(
@@ -138,6 +154,46 @@ def extract_code_blocks(raw: str, limit: int = 6,
         if len(blocks) >= limit:
             break
     return blocks
+
+
+_GH_BLOB_RE = re.compile(r'href="(/[^"/]+/[^"/]+/blob/[^"/]+/[^"]+)"')
+
+
+def extract_raw_links(raw: str, page_url: str, limit: int = 8) -> list[str]:
+    """Turn GitHub blob links on a repo page into raw file URLs."""
+    links: list[str] = []
+    if "github.com" not in page_url:
+        return links
+    seen: set[str] = set()
+    for match in _GH_BLOB_RE.finditer(raw):
+        parts = html.unescape(match.group(1)).strip("/").split("/", 4)
+        if len(parts) != 5 or parts[2] != "blob":
+            continue
+        owner, repo, ref, file_path = parts[0], parts[1], parts[3], parts[4]
+        url = (f"https://raw.githubusercontent.com/{owner}/{repo}/"
+               f"{ref}/{file_path}")
+        if url in seen:
+            continue
+        seen.add(url)
+        links.append(url)
+        if len(links) >= limit:
+            break
+    return links
+
+
+_TOKEN_RE = re.compile(r"[a-z][a-z0-9+.-]{2,}")
+
+
+def _stem(word: str) -> str:
+    """Crude suffix stripper so 'downloads' and 'downloaded' match."""
+    for suffix in ("ing", "ed", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[:-len(suffix)]
+    return word
+
+
+def _word_stems(text: str) -> set[str]:
+    return {_stem(word) for word in _TOKEN_RE.findall(text.lower())}
 
 
 def keywords(text: str, limit: int = 12) -> list[str]:
@@ -470,19 +526,25 @@ def tool_scripts_search(query: str, limit: int = 8) -> dict:
     }
 
 
-def tool_fetch_page(url: str, max_chars: int = 8000) -> dict:
+def tool_fetch_page(url: str, max_chars: int = 8000,
+                    code_max_chars: int = 4000, raw: bool = False) -> dict:
     url = url.strip()
     if not re.match(r"^https?://", url):
         url = "https://" + url
     url = url.rstrip(".,);\"'")
     try:
-        raw = sa.fetch(url, timeout=20.0)
+        body = sa.fetch(url, timeout=20.0)
     except sa.SearchError as exc:
         return {"ok": False, "url": url, "error": str(exc)}
-    text = html_to_text(raw)
-    return {"ok": True, "url": url, "title": page_title(raw),
-            "text": text[:max_chars], "chars": len(raw),
-            "code": extract_code_blocks(raw),
+    if raw:
+        return {"ok": True, "url": url, "title": "", "text": body[:max_chars],
+                "chars": len(body), "code": [], "raw_links": [],
+                "truncated": len(body) > max_chars}
+    text = html_to_text(body)
+    return {"ok": True, "url": url, "title": page_title(body),
+            "text": text[:max_chars], "chars": len(body),
+            "code": extract_code_blocks(body, max_chars=code_max_chars),
+            "raw_links": extract_raw_links(body, url),
             "truncated": len(text) > max_chars}
 
 
@@ -611,7 +673,9 @@ def build_registry(memory_path: Path | None = None) -> ToolRegistry:
     registry.register(ToolSpec(
         "fetch_page", "Fetch a URL and return its text content and title.",
         {"url": ("string", "http(s) URL to fetch"),
-         "max_chars": ("integer", "truncate text to this many chars")},
+         "max_chars": ("integer", "truncate text to this many chars"),
+         "code_max_chars": ("integer", "truncate each code block to this"),
+         "raw": ("boolean", "return the body as plain text, no HTML parsing")},
         required=("url",)), tool_fetch_page)
 
     registry.register(ToolSpec(
@@ -767,6 +831,10 @@ _INTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"\b(remember|note that|keep in mind|don't forget|dont forget)\b")),
     ("recall", re.compile(
         r"\b(recall|what did i (say|tell|ask)|do you remember)\b")),
+    ("code", re.compile(
+        r"\b(?:create|write|make|generate|build|find)\b[^.?!]*"
+        r"\b(?:script|code|program|class|object|function|module|snippet)\b",
+        re.I)),
     ("github", re.compile(r"\bgithub\b")),
     ("gitlab", re.compile(r"\bgitlab\b")),
     ("read", re.compile(r"\b(read|cat|view)\b")),
@@ -789,6 +857,15 @@ _INTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+
+
+def _code_query_variant(query: str) -> str:
+    """Drop language/'script' filler so the web search targets the task."""
+    kept = [word.strip(".,?!")
+            for word in query.split()
+            if word.strip(".,?!").lower() not in _QUERY_FILLER
+            and word.strip(".,?!").lower() not in STOPWORDS]
+    return " ".join(kept)
 
 
 def _extract_url(goal: str) -> str | None:
@@ -897,6 +974,14 @@ class RuleBasedPlanner:
             return Plan("steps", steps=[
                 Step("recall", {"query": query}, "search memory")])
 
+        if intent == "code":
+            if _extract_path(text):
+                return None          # writing to a file -> let "write" handle it
+            return Plan("pipeline", pipeline="find_code",
+                        steps=[Step("web_search",
+                                    {"query": strip_verbs(text)},
+                                    "find code on the web")])
+
         if intent == "github":
             query = re.sub(r"\bgithub\b", "", query, flags=re.I).strip(" ,-") \
                 or query
@@ -947,6 +1032,12 @@ class RuleBasedPlanner:
         if intent == "write":
             path = _extract_path(text)
             if not path:
+                if re.search(r"\b(script|code|program|class|object|function|"
+                             r"module|snippet|app|tool)\b", text, re.I):
+                    return Plan("pipeline", pipeline="find_code",
+                                steps=[Step("web_search",
+                                            {"query": strip_verbs(text)},
+                                            "find code on the web")])
                 return Plan("clarify",
                             question="Which file path should I write to?")
             query = _pipeline_query(text, path)
@@ -968,6 +1059,13 @@ class RuleBasedPlanner:
                         question=f"What content should I write into {path}?")
 
         if intent == "search":
+            if re.search(r"\b(script|code|program|class|object|function|"
+                         r"module|snippet)\b", text, re.I) and \
+                    re.search(r"\b(create|write|make|generate|find)\b",
+                              text, re.I):
+                return Plan("pipeline", pipeline="find_code",
+                            steps=[Step("web_search", {"query": query},
+                                        "find code on the web")])
             if re.search(r"\b(script|scripts|repo|repos|repository|"
                          r"repositories|tool|tools)\b", text, re.I):
                 return Plan("pipeline", pipeline="search_content",
@@ -1076,7 +1174,8 @@ class Agent:
     def __init__(self, registry: ToolRegistry, planner: Any,
                  policy: Policy | None = None, max_steps: int = 12,
                  trace: bool = True, memory_path: Path | None = None,
-                 script_path: Path | None = None) -> None:
+                 script_path: Path | None = None,
+                 force_code: bool = False) -> None:
         self.registry = registry
         self.planner = planner
         self.policy = policy or Policy()
@@ -1084,6 +1183,7 @@ class Agent:
         self.trace_enabled = trace
         self.memory_path = memory_path or DEFAULT_MEMORY
         self.script_path = script_path
+        self.force_code = force_code
 
     # -- tracing ------------------------------------------------------------ #
 
@@ -1117,6 +1217,11 @@ class Agent:
         if not goal:
             return "Tell me what you want done."
         self.trace(f"goal: {goal}")
+        if self.force_code:
+            plan = Plan("pipeline", pipeline="find_code",
+                        steps=[Step("web_search",
+                                    {"query": strip_verbs(goal)})])
+            return self._run_pipeline(plan, goal)
         observations: list[Observation] = []
         for _ in range(self.max_steps):
             plan = self.planner.plan(goal, observations)
@@ -1202,6 +1307,82 @@ class Agent:
             parts.append(f"# {data.get('title') or item.get('title', '')}\n"
                          f"{url}\n\n{body}")
         return "\n\n---\n\n".join(parts)
+
+    def _pipe_find_code(self, plan: Plan, goal: str) -> str:
+        """Search the web, fetch the best matching script, print only the code."""
+        query = plan.steps[0].args.get("query") or goal
+        obs = self.execute(plan.steps[0])
+        query = obs.data.get("query") or query
+        results = list(obs.data.get("results", []))
+        variant = _code_query_variant(query)
+        if variant and variant != query:
+            self.trace(f"also searching {variant!r}")
+            args = dict(plan.steps[0].args)
+            args["query"] = variant
+            alt = self.execute(Step(plan.steps[0].tool, args))
+            seen = {item.get("url") for item in results}
+            results += [item for item in alt.data.get("results", [])
+                        if item.get("url") not in seen]
+        best_block, best_score = self._best_code(results, query)
+        if (best_block is None or best_score < 20.0) and \
+                plan.steps[0].tool != "scripts_search":
+            alt = self.execute(Step("scripts_search", {"query": query}))
+            alt_block, alt_score = self._best_code(
+                alt.data.get("results", []), query)
+            if alt_block is not None and (best_block is None
+                                          or alt_score > best_score):
+                best_block, best_score = alt_block, alt_score
+        if best_block is None:
+            return ("I could not find a script for that. Try describing what it "
+                    "should do, the language, and any library.")
+        return best_block
+
+    def _best_code(self, results: Sequence[dict],
+                   query: str) -> tuple[str | None, float]:
+        wanted = [word for word in keywords(query, limit=12)
+                  if word not in _CODE_STOPWORDS]
+        if not wanted:
+            wanted = keywords(query, limit=12)
+        wanted_stems = {_stem(word) for word in wanted}
+        best_score: float | None = None
+        best_block: str | None = None
+        for item in results[:8]:
+            page = self.execute(Step("fetch_page", {
+                "url": item.get("url", ""),
+                "max_chars": 20000, "code_max_chars": 8000}))
+            if not page.ok:
+                continue
+            context_stems = _word_stems(item.get("title", "") + " " +
+                                        item.get("snippet", ""))
+            boost = 3.0 * len(wanted_stems & context_stems)
+            for block in page.data.get("code") or []:
+                score = self._score_code(block, wanted_stems) + boost
+                if best_score is None or score > best_score:
+                    best_score, best_block = score, block
+            for raw_url in (page.data.get("raw_links") or [])[:3]:
+                file_page = self.execute(Step("fetch_page", {
+                    "url": raw_url, "max_chars": 20000, "raw": True}))
+                if not file_page.ok:
+                    continue
+                content = file_page.data.get("text") or ""
+                if len(content) < 40:
+                    continue
+                score = self._score_code(content, wanted_stems) + boost
+                if best_score is None or score > best_score:
+                    best_score, best_block = score, content[:8000]
+        return best_block, best_score if best_score is not None else 0.0
+
+    @staticmethod
+    def _score_code(block: str, wanted_stems: set[str]) -> float:
+        hits = len(wanted_stems & _word_stems(block))
+        score = hits * 20.0
+        if re.search(r"(?m)^\s*(def |class |function |func |import |from |"
+                     r"#include|public |private |const |let |var |async def )",
+                     block):
+            score += 10.0
+        if block.count("\n") >= 3:
+            score += 3.0
+        return score + min(len(block), 4000) / 800.0
 
     def _pipe_research(self, plan: Plan, goal: str) -> str:
         query = (plan.steps[0].args.get("query") if plan.steps else goal) or goal
@@ -1301,6 +1482,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--script", metavar="PATH", default=None,
                         help="write search results to this script file and "
                              "print only its path (no URL list)")
+    parser.add_argument("--code", action="store_true",
+                        help="find a script for the description and print "
+                             "only the code (no links)")
     parser.add_argument("--max-steps", type=int, default=12)
     parser.add_argument("--yes", action="store_true",
                         help="auto-approve mutating tools")
@@ -1331,7 +1515,7 @@ def _make_agent(args: argparse.Namespace) -> Agent:
                     interactive=True if args.goal is None else None)
     return Agent(registry, planner, policy=policy, max_steps=args.max_steps,
                  trace=trace, memory_path=Path(args.memory),
-                 script_path=script_path)
+                 script_path=script_path, force_code=args.code)
 
 
 def _print_tools(registry: ToolRegistry) -> None:
