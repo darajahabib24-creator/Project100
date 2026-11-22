@@ -393,11 +393,26 @@ class TestAgentLoop(unittest.TestCase):
                                return_value=web_response(["https://a.example/"])):
             answer = self.agent.run(f"write a script that searches for pdf "
                                     f"tools to {out}")
-        self.assertIn("Wrote search script", answer)
+        self.assertIn("Created script", answer)
+        self.assertIn(out, answer)
         with open(out) as handle:
             content = handle.read()
         self.assertTrue(content.startswith("#!/usr/bin/env bash"))
         self.assertIn("https://a.example/", content)
+
+    def test_script_mode_hides_urls(self):
+        out = os.path.join(self.tmp, "search.sh")
+        agent = ag.Agent(self.registry, ag.RuleBasedPlanner(),
+                         policy=ag.Policy(assume_yes=True, interactive=False),
+                         trace=False, memory_path=Path(self.tmp) / "mem.json",
+                         script_path=Path(out))
+        with mock.patch.object(sa, "search_web",
+                               return_value=web_response(["https://a.example/"])):
+            answer = agent.run("search for python web scrapers")
+        self.assertEqual(answer, f"Created script: {out}")
+        self.assertNotIn("http", answer)
+        with open(out) as handle:
+            self.assertIn("https://a.example/", handle.read())
 
     def test_fetch_extract_pipeline(self):
         html = ("<html><head><title>Doc</title></head><body>"
@@ -441,6 +456,16 @@ class TestCLI(unittest.TestCase):
         data = json.loads(out.getvalue())
         self.assertIn("https://a.example/", data["answer"])
         self.assertEqual(data["brain"], "rules")
+
+    def test_script_option(self):
+        path = os.path.join(tempfile.mkdtemp(), "out.sh")
+        with mock.patch.object(sa, "search_web",
+                               return_value=web_response(["https://a.example/"])), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            code = ag.main(["search for x", "--script", path, "--no-trace"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.getvalue().strip(), f"Created script: {path}")
+        self.assertTrue(os.path.isfile(path))
 
     def test_one_shot_repl_exit(self):
         with contextlib.redirect_stdout(io.StringIO()), \

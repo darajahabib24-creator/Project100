@@ -1041,13 +1041,15 @@ class Agent:
 
     def __init__(self, registry: ToolRegistry, planner: Any,
                  policy: Policy | None = None, max_steps: int = 12,
-                 trace: bool = True, memory_path: Path | None = None) -> None:
+                 trace: bool = True, memory_path: Path | None = None,
+                 script_path: Path | None = None) -> None:
         self.registry = registry
         self.planner = planner
         self.policy = policy or Policy()
         self.max_steps = max(1, max_steps)
         self.trace_enabled = trace
         self.memory_path = memory_path or DEFAULT_MEMORY
+        self.script_path = script_path
 
     # -- tracing ------------------------------------------------------------ #
 
@@ -1099,9 +1101,38 @@ class Agent:
             if len(plan.steps) > 1:
                 for extra in plan.steps[1:]:
                     observations.append(self.execute(extra))
+            if self.script_path:
+                scripted = self._maybe_script(goal, observations)
+                if scripted is not None:
+                    return scripted
         final = self.planner.plan(goal, observations)
         return final.text if final.mode == "answer" else \
             compose_answer(goal, observations)
+
+    def _maybe_script(self, goal: str,
+                      observations: Sequence[Observation]) -> str | None:
+        """With --script, turn the last search into a script and say only that."""
+        search_tools = {"web_search", "github_search", "gitlab_search",
+                        "scripts_search"}
+        for obs in reversed(observations):
+            if obs.step.tool not in search_tools or not obs.ok:
+                continue
+            results = [sa.SearchResult(
+                item.get("title", ""), item.get("url", ""),
+                item.get("snippet", ""), item.get("engine", ""),
+                item.get("source", "web"))
+                for item in obs.data.get("results", [])]
+            if not results:
+                return None
+            query = obs.data.get("query") or goal
+            content = sa.render_script(query, results)
+            write = self.execute(Step("write_file",
+                                      {"path": str(self.script_path),
+                                       "content": content}))
+            if write.ok:
+                return f"Created script: {self.script_path}"
+            return f"Could not write {self.script_path}: {write.error}"
+        return None
 
     # -- pipelines ---------------------------------------------------------- #
 
@@ -1177,7 +1208,7 @@ class Agent:
                                   {"path": path,
                                    "content": sa.render_script(query, results)}))
         if write.ok:
-            return f"Wrote search script to {path} ({len(results)} result(s))."
+            return f"Created script: {path}"
         return f"Could not write {path}: {write.error}"
 
 
@@ -1206,6 +1237,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ollama-model", default=OLLAMA_MODEL)
     parser.add_argument("--memory", default=str(DEFAULT_MEMORY),
                         help="path to the persistent memory JSON file")
+    parser.add_argument("--script", metavar="PATH", default=None,
+                        help="write search results to this script file and "
+                             "print only its path (no URL list)")
     parser.add_argument("--max-steps", type=int, default=12)
     parser.add_argument("--yes", action="store_true",
                         help="auto-approve mutating tools")
@@ -1231,10 +1265,12 @@ def _make_agent(args: argparse.Namespace) -> Agent:
         planner: Any = ModelPlanner(brain, registry)
     else:
         planner = RuleBasedPlanner()
-    policy = Policy(assume_yes=args.yes,
+    script_path = Path(args.script) if args.script else None
+    policy = Policy(assume_yes=args.yes or script_path is not None,
                     interactive=True if args.goal is None else None)
     return Agent(registry, planner, policy=policy, max_steps=args.max_steps,
-                 trace=trace, memory_path=Path(args.memory))
+                 trace=trace, memory_path=Path(args.memory),
+                 script_path=script_path)
 
 
 def _print_tools(registry: ToolRegistry) -> None:

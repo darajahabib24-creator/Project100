@@ -51,6 +51,7 @@ python3 agent.py "search for python web scraper" --json
 python3 agent.py "find me a repo for web scraping"
 python3 agent.py "write a script that searches for pdf tools to find.sh" --yes
 python3 agent.py "search for rust tools and save the results to out.txt" --yes
+python3 agent.py "search for pdf tools" --script pdf_search.sh
 python3 agent.py "remember that I like oolong tea" --yes
 python3 agent.py "what did I say about tea"
 python3 agent.py "run echo hello" --yes
@@ -64,7 +65,14 @@ mutating: in a terminal they ask for confirmation, and in a non-interactive
 session they are refused unless `--yes` is passed.
 
 Options: `--model {rules,ollama}` (default `rules`), `--memory PATH`,
-`--max-steps N`, `--yes`, `--trace/--no-trace`, `--json`, `--tools`.
+`--max-steps N`, `--yes`, `--trace/--no-trace`, `--json`, `--tools`,
+`--script PATH`.
+
+`--script PATH` writes the search results to a runnable bash script and the
+answer is only that path -- no URL list is printed. The same is true when the
+goal itself asks for a script ("write a script that searches for X to PATH"):
+the file is created and the answer is just `Created script: PATH`. Passing
+`--script` implies `--yes` for that one file write.
 
 ### Brains
 
