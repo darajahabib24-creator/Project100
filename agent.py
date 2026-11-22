@@ -112,6 +112,34 @@ def page_title(raw: str) -> str:
     return _WS_RE.sub(" ", _TAG_RE.sub(" ", html.unescape(match.group(1)))).strip()
 
 
+_BR_RE = re.compile(r"<br\s*/?>", re.I)
+_CODE_BLOCK_RE = re.compile(r"<(pre|code)\b[^>]*>(.*?)</\1>", re.S | re.I)
+
+
+def _code_inner(inner: str) -> str:
+    inner = _BR_RE.sub("\n", inner)
+    inner = _TAG_RE.sub("", inner)
+    return html.unescape(inner).strip("\n")
+
+
+def extract_code_blocks(raw: str, limit: int = 6,
+                        max_chars: int = 1500) -> list[str]:
+    """Pull <pre>/<code> blocks out of HTML, longest first, de-duplicated."""
+    candidates: list[str] = []
+    for match in _CODE_BLOCK_RE.finditer(raw):
+        text = _code_inner(match.group(2))
+        if len(text) >= 20:
+            candidates.append(text)
+    blocks: list[str] = []
+    for text in sorted(candidates, key=len, reverse=True):
+        if any(text in block for block in blocks):
+            continue
+        blocks.append(text[:max_chars])
+        if len(blocks) >= limit:
+            break
+    return blocks
+
+
 def keywords(text: str, limit: int = 12) -> list[str]:
     """Content words of *text*, lowercased, stopwords removed."""
     words = re.findall(r"[a-z][a-z0-9+._-]{2,}", text.lower())
@@ -454,6 +482,7 @@ def tool_fetch_page(url: str, max_chars: int = 8000) -> dict:
     text = html_to_text(raw)
     return {"ok": True, "url": url, "title": page_title(raw),
             "text": text[:max_chars], "chars": len(raw),
+            "code": extract_code_blocks(raw),
             "truncated": len(text) > max_chars}
 
 
@@ -845,7 +874,7 @@ class RuleBasedPlanner:
                         steps=[Step("web_search", {"query": strip_verbs(text)},
                                     "question: search first")],
                         thoughts=["question detected -> research pipeline"])
-        return Plan("steps",
+        return Plan("pipeline", pipeline="search_content",
                     steps=[Step("web_search", {"query": strip_verbs(text)},
                                 "default intent: search")])
 
@@ -871,14 +900,16 @@ class RuleBasedPlanner:
         if intent == "github":
             query = re.sub(r"\bgithub\b", "", query, flags=re.I).strip(" ,-") \
                 or query
-            return Plan("steps", steps=[
-                Step("github_search", {"query": query}, "GitHub intent")])
+            return Plan("pipeline", pipeline="search_content",
+                        steps=[Step("github_search", {"query": query},
+                                    "GitHub search")])
 
         if intent == "gitlab":
             query = re.sub(r"\bgitlab\b", "", query, flags=re.I).strip(" ,-") \
                 or query
-            return Plan("steps", steps=[
-                Step("gitlab_search", {"query": query}, "GitLab intent")])
+            return Plan("pipeline", pipeline="search_content",
+                        steps=[Step("gitlab_search", {"query": query},
+                                    "GitLab search")])
 
         if intent == "read":
             path = _extract_path(text)
@@ -892,8 +923,9 @@ class RuleBasedPlanner:
                 return Plan("pipeline", pipeline="fetch_extract",
                             steps=[Step("fetch_page", {"url": url},
                                         "fetch the requested URL")])
-            return Plan("steps", steps=[
-                Step("web_search", {"query": query}, "fetch intent, no URL")])
+            return Plan("pipeline", pipeline="search_content",
+                        steps=[Step("web_search", {"query": query},
+                                    "fetch intent, no URL")])
 
         if intent == "list":
             return Plan("steps", steps=[
@@ -938,10 +970,12 @@ class RuleBasedPlanner:
         if intent == "search":
             if re.search(r"\b(script|scripts|repo|repos|repository|"
                          r"repositories|tool|tools)\b", text, re.I):
-                return Plan("steps", steps=[
-                    Step("scripts_search", {"query": query}, "code search")])
-            return Plan("steps", steps=[
-                Step("web_search", {"query": query}, "web search")])
+                return Plan("pipeline", pipeline="search_content",
+                            steps=[Step("scripts_search", {"query": query},
+                                        "code search")])
+            return Plan("pipeline", pipeline="search_content",
+                        steps=[Step("web_search", {"query": query},
+                                    "web search")])
 
         return None
 
@@ -1101,38 +1135,28 @@ class Agent:
             if len(plan.steps) > 1:
                 for extra in plan.steps[1:]:
                     observations.append(self.execute(extra))
-            if self.script_path:
-                scripted = self._maybe_script(goal, observations)
-                if scripted is not None:
-                    return scripted
         final = self.planner.plan(goal, observations)
         return final.text if final.mode == "answer" else \
             compose_answer(goal, observations)
 
-    def _maybe_script(self, goal: str,
-                      observations: Sequence[Observation]) -> str | None:
-        """With --script, turn the last search into a script and say only that."""
-        search_tools = {"web_search", "github_search", "gitlab_search",
-                        "scripts_search"}
-        for obs in reversed(observations):
-            if obs.step.tool not in search_tools or not obs.ok:
-                continue
-            results = [sa.SearchResult(
-                item.get("title", ""), item.get("url", ""),
-                item.get("snippet", ""), item.get("engine", ""),
-                item.get("source", "web"))
-                for item in obs.data.get("results", [])]
-            if not results:
-                return None
-            query = obs.data.get("query") or goal
-            content = sa.render_script(query, results)
-            write = self.execute(Step("write_file",
-                                      {"path": str(self.script_path),
-                                       "content": content}))
-            if write.ok:
-                return f"Created script: {self.script_path}"
-            return f"Could not write {self.script_path}: {write.error}"
-        return None
+    def _script_from_results(self, obs: Observation,
+                             goal: str) -> str | None:
+        """Render a search observation as a script and write it to --script."""
+        results = [sa.SearchResult(
+            item.get("title", ""), item.get("url", ""),
+            item.get("snippet", ""), item.get("engine", ""),
+            item.get("source", "web"))
+            for item in obs.data.get("results", [])]
+        if not results:
+            return None
+        query = obs.data.get("query") or goal
+        content = sa.render_script(query, results)
+        write = self.execute(Step("write_file",
+                                  {"path": str(self.script_path),
+                                   "content": content}))
+        if write.ok:
+            return f"Created script: {self.script_path}"
+        return f"Could not write {self.script_path}: {write.error}"
 
     # -- pipelines ---------------------------------------------------------- #
 
@@ -1141,6 +1165,43 @@ class Agent:
         if handler is None:
             return f"unknown pipeline {plan.pipeline!r}"
         return handler(plan, goal)
+
+    def _pipe_search_content(self, plan: Plan, goal: str) -> str:
+        """Search, then fetch the top results and show their content/code."""
+        search_step = plan.steps[0]
+        obs = self.execute(search_step)
+        results = obs.data.get("results", [])
+        query = obs.data.get("query") or goal
+        if not results:
+            retry = reformulate_query(query)
+            if retry != query:
+                self.trace(f"retrying search with {retry!r}")
+                args = dict(search_step.args)
+                args["query"] = retry
+                obs = self.execute(Step(search_step.tool, args))
+                results = obs.data.get("results", [])
+        if not results:
+            return f"I could not find anything for {query!r}."
+        if self.script_path:
+            scripted = self._script_from_results(obs, goal)
+            if scripted is not None:
+                return scripted
+        parts: list[str] = []
+        for item in results[:3]:
+            url = item.get("url", "")
+            page = self.execute(Step("fetch_page",
+                                     {"url": url, "max_chars": 12000}))
+            if not page.ok:
+                parts.append(f"# {item.get('title', '')}\n{url}\n"
+                             f"(could not fetch: {page.error})")
+                continue
+            data = page.data
+            code = data.get("code") or []
+            body = "\n\n".join(code[:4])[:3000] if code \
+                else (data.get("text") or "")[:1500]
+            parts.append(f"# {data.get('title') or item.get('title', '')}\n"
+                         f"{url}\n\n{body}")
+        return "\n\n---\n\n".join(parts)
 
     def _pipe_research(self, plan: Plan, goal: str) -> str:
         query = (plan.steps[0].args.get("query") if plan.steps else goal) or goal

@@ -74,12 +74,19 @@ goal itself asks for a script ("write a script that searches for X to PATH"):
 the file is created and the answer is just `Created script: PATH`. Passing
 `--script` implies `--yes` for that one file write.
 
+Search goals (`search ...`, `find me a repo ...`, `github ...`, `gitlab ...`)
+default to the `search_content` pipeline: the agent searches, fetches the top
+few results and prints each page's text or extracted code blocks, so you get
+the actual content rather than a bare list of links. Add `--script PATH` if
+you want the results written to a script instead.
+
 ### Brains
 
-- `rules` (default): no model at all. Intent matching plus a few multi-step
-  pipelines (`research`, `fetch_extract`, `save_results`,
-  `make_search_script`). Questions are answered extractively: search, fetch
-  the best result, rank sentences by keyword overlap.
+- `rules` (default): no model at all. Intent matching plus multi-step
+  pipelines: `search_content` (search, fetch the top results, print their
+  text or code blocks -- not just links), `research` (search, fetch, extract
+  an answer with a citation), `fetch_extract`, `save_results`,
+  `make_search_script`.
 - `ollama`: uses a free local model through `http://127.0.0.1:11434` (set
   `OLLAMA_BASE` / `--ollama-base` and `OLLAMA_MODEL` / `--ollama-model`).
   Still no API key and nothing leaves the machine. The script exits with a

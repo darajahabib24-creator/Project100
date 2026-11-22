@@ -71,6 +71,13 @@ class TestTextHelpers(unittest.TestCase):
     def test_extract_answer_empty_text(self):
         self.assertEqual(ag.extract_answer("", "anything"), "")
 
+    def test_extract_code_blocks(self):
+        raw = ("<p>text</p><pre><code>import os\nprint(os.getcwd())</code></pre>"
+               "<pre>short</pre><code>x = 1</code>")
+        blocks = ag.extract_code_blocks(raw)
+        self.assertTrue(any("import os" in block for block in blocks))
+        self.assertFalse(any(block.strip() == "short" for block in blocks))
+
     def test_strip_verbs(self):
         self.assertEqual(ag.strip_verbs("please search for cats"), "cats")
         self.assertEqual(ag.strip_verbs("can you find a repo"), "find a repo")
@@ -224,9 +231,6 @@ class TestRuleBasedPlanner(unittest.TestCase):
     def plan(self, goal):
         return self.planner.plan(goal, [])
 
-    def tools_of(self, plan):
-        return [step.tool for step in plan.steps]
-
     def test_bare_url(self):
         plan = self.plan("https://example.com/article")
         self.assertEqual(plan.mode, "steps")
@@ -235,7 +239,9 @@ class TestRuleBasedPlanner(unittest.TestCase):
 
     def test_search(self):
         plan = self.plan("search for python web scrapers")
-        self.assertEqual(self.tools_of(plan), ["web_search"])
+        self.assertEqual(plan.mode, "pipeline")
+        self.assertEqual(plan.pipeline, "search_content")
+        self.assertEqual(plan.steps[0].tool, "web_search")
         self.assertIn("python web scrapers", plan.steps[0].args["query"])
 
     def test_question_is_research_pipeline(self):
@@ -245,13 +251,17 @@ class TestRuleBasedPlanner(unittest.TestCase):
 
     def test_code_search(self):
         plan = self.plan("find me a repo for web scraping")
-        self.assertEqual(self.tools_of(plan), ["scripts_search"])
+        self.assertEqual(plan.mode, "pipeline")
+        self.assertEqual(plan.pipeline, "search_content")
+        self.assertEqual(plan.steps[0].tool, "scripts_search")
 
     def test_github_and_gitlab(self):
-        self.assertEqual(self.tools_of(self.plan("github web scraper")),
-                         ["github_search"])
-        self.assertEqual(self.tools_of(self.plan("gitlab web scraper")),
-                         ["gitlab_search"])
+        for goal, tool in (("github web scraper", "github_search"),
+                           ("gitlab web scraper", "gitlab_search")):
+            plan = self.plan(goal)
+            self.assertEqual(plan.mode, "pipeline")
+            self.assertEqual(plan.pipeline, "search_content")
+            self.assertEqual(plan.steps[0].tool, tool)
 
     def test_list_and_read(self):
         plan = self.plan("list files in /tmp")
@@ -299,7 +309,8 @@ class TestRuleBasedPlanner(unittest.TestCase):
 
     def test_fallback_is_search(self):
         plan = self.plan("tell me something interesting")
-        self.assertEqual(plan.mode, "steps")
+        self.assertEqual(plan.mode, "pipeline")
+        self.assertEqual(plan.pipeline, "search_content")
         self.assertEqual(plan.steps[0].tool, "web_search")
 
     def test_second_call_answers(self):
@@ -346,10 +357,15 @@ class TestAgentLoop(unittest.TestCase):
                               trace=False,
                               memory_path=Path(self.tmp) / "mem.json")
 
-    def test_search_goal(self):
+    def test_search_goal_shows_content_not_just_link(self):
+        html = ("<html><head><title>Scraper</title></head><body>"
+                "<p>Intro text about scraping.</p>"
+                "<pre>import requests\nprint('hi')</pre></body></html>")
         with mock.patch.object(sa, "search_web",
-                               return_value=web_response(["https://a.example/"])):
+                               return_value=web_response(["https://a.example/"])), \
+             mock.patch.object(sa, "fetch", return_value=html):
             answer = self.agent.run("search for python web scrapers")
+        self.assertIn("import requests", answer)
         self.assertIn("https://a.example/", answer)
 
     def test_research_pipeline_fetches(self):
@@ -450,6 +466,8 @@ class TestCLI(unittest.TestCase):
     def test_one_shot_json(self):
         with mock.patch.object(sa, "search_web",
                                return_value=web_response(["https://a.example/"])), \
+             mock.patch.object(sa, "fetch",
+                               return_value="<html><body><p>hi</p></body></html>"), \
              contextlib.redirect_stdout(io.StringIO()) as out:
             code = ag.main(["search for x", "--json", "--no-trace"])
         self.assertEqual(code, 0)
